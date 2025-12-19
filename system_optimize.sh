@@ -1148,8 +1148,10 @@ for disk in /sys/block/*/queue/rotational; do
     # Detect cloud storage type
     DISK_CLOUD[${DEV}]="local"
     if [[ "${CLOUD_PROVIDER}" != "none" ]]; then
-        MODEL=$(tr -d ' ' <"/sys/block/${DEV}/device/model" 2>/dev/null) || MODEL=""
-        VENDOR=$(tr -d ' ' <"/sys/block/${DEV}/device/vendor" 2>/dev/null) || VENDOR=""
+        MODEL=""
+        VENDOR=""
+        [[ -f "/sys/block/${DEV}/device/model" ]] && MODEL=$(tr -d ' ' <"/sys/block/${DEV}/device/model" 2>/dev/null)
+        [[ -f "/sys/block/${DEV}/device/vendor" ]] && VENDOR=$(tr -d ' ' <"/sys/block/${DEV}/device/vendor" 2>/dev/null)
         case ${CLOUD_PROVIDER} in
             aws)
                 # AWS: NVMe EBS or NVMe instance store
@@ -1640,6 +1642,18 @@ if [[ ${OPT_DISABLE_MITIGATIONS} -eq 1 ]]; then
         run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} /" /etc/default/grub
         run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub
 
+        # Azure/cloud-init VMs: also update grub.d override file
+        if [[ -f /etc/default/grub.d/50-cloudimg-settings.cfg ]]; then
+            backup_file "/etc/default/grub.d/50-cloudimg-settings.cfg"
+            run sed -i 's/mitigations=[^ "]*//g; s/tsx=[^ "]*//g; s/tsx_async_abort=[^ "]*//g; s/mds=[^ "]*//g; s/l1tf=[^ "]*//g; s/retbleed=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
+            if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub.d/50-cloudimg-settings.cfg; then
+                run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} /" /etc/default/grub.d/50-cloudimg-settings.cfg
+            else
+                run bash -c "echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} ${MITIG_PARAMS}\"' >> /etc/default/grub.d/50-cloudimg-settings.cfg"
+            fi
+            run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub.d/50-cloudimg-settings.cfg
+        fi
+
         update_grub_config || true
         echo "  ✓ Mitigations: will be disabled after reboot"
     fi
@@ -1652,6 +1666,18 @@ if [[ -n "${OPT_ISOLATE_CPUS}" ]] && [[ -f /etc/default/grub ]]; then
     run sed -i 's/isolcpus=[^ "]*//g; s/nohz_full=[^ "]*//g; s/rcu_nocbs=[^ "]*//g' /etc/default/grub
     run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} /" /etc/default/grub
     run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub
+
+    # Azure/cloud-init VMs: also update grub.d override file
+    if [[ -f /etc/default/grub.d/50-cloudimg-settings.cfg ]]; then
+        backup_file "/etc/default/grub.d/50-cloudimg-settings.cfg"
+        run sed -i 's/isolcpus=[^ "]*//g; s/nohz_full=[^ "]*//g; s/rcu_nocbs=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
+        if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub.d/50-cloudimg-settings.cfg; then
+            run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} /" /etc/default/grub.d/50-cloudimg-settings.cfg
+        else
+            run bash -c "echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} ${ISOL_PARAMS}\"' >> /etc/default/grub.d/50-cloudimg-settings.cfg"
+        fi
+        run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub.d/50-cloudimg-settings.cfg
+    fi
 
     update_grub_config || true
     echo "  ✓ CPU Isolation: ${OPT_ISOLATE_CPUS} (after reboot)"
@@ -1687,6 +1713,20 @@ if [[ "${OPT_PROFILE}" = "latency" ]] && [[ -f /etc/default/grub ]]; then
         # Add new parameters
         run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}/" /etc/default/grub
         run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub
+
+        # Azure/cloud-init VMs: also update grub.d override file
+        if [[ -f /etc/default/grub.d/50-cloudimg-settings.cfg ]]; then
+            backup_file "/etc/default/grub.d/50-cloudimg-settings.cfg"
+            run sed -i 's/processor.max_cstate=[^ "]*//g; s/intel_idle.max_cstate=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
+            run sed -i 's/idle=[^ "]*//g; s/nowatchdog//g; s/nmi_watchdog=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
+            run sed -i 's/transparent_hugepage=[^ "]*//g; s/skew_tick=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
+            if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub.d/50-cloudimg-settings.cfg; then
+                run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}/" /etc/default/grub.d/50-cloudimg-settings.cfg
+            else
+                run bash -c "echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} ${LATENCY_PARAMS}\"' >> /etc/default/grub.d/50-cloudimg-settings.cfg"
+            fi
+            run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub.d/50-cloudimg-settings.cfg
+        fi
 
         update_grub_config || true
         echo "  ✓ Latency kernel params: configured (reboot required)"
@@ -2002,21 +2042,33 @@ if [[ "${HW_CPU_VENDOR}" = "GenuineIntel" ]]; then
             ;;
     esac
 
-    # Apply EPP to all CPUs
-    for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
-        [[ -f "${epp}" ]] && write_value_quiet "${epp}" "${EPP_VALUE}"
-    done
+    # Apply EPP to all CPUs (only if sysfs files exist)
+    EPP_APPLIED=0
+    if ls /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference &>/dev/null; then
+        for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+            [[ -f "${epp}" ]] && write_value_quiet "${epp}" "${EPP_VALUE}" && EPP_APPLIED=1
+        done
+    fi
 
     # Set EPB (Energy Performance Bias) if available
-    if command -v x86_energy_perf_policy &>/dev/null; then
-        case ${OPT_PROFILE} in
-            server | vm) run_quiet x86_energy_perf_policy performance ;;
-            workstation) run_quiet x86_energy_perf_policy normal ;;
-            laptop) run_quiet x86_energy_perf_policy powersave ;;
-            latency) run_quiet x86_energy_perf_policy performance ;;
-        esac
+    # Skip on VMs - x86_energy_perf_policy can hang when MSR access is restricted
+    if [[ "${HW_IS_VM}" = "none" ]] && command -v x86_energy_perf_policy &>/dev/null; then
+        # Use timeout to prevent hanging on restricted systems
+        if command -v timeout &>/dev/null; then
+            case ${OPT_PROFILE} in
+                server | vm) timeout 2 x86_energy_perf_policy performance &>/dev/null || true ;;
+                workstation) timeout 2 x86_energy_perf_policy normal &>/dev/null || true ;;
+                laptop) timeout 2 x86_energy_perf_policy powersave &>/dev/null || true ;;
+                latency) timeout 2 x86_energy_perf_policy performance &>/dev/null || true ;;
+            esac
+        fi
     fi
-    echo "  ✓ EPP: ${EPP_VALUE}"
+
+    if [[ ${EPP_APPLIED} -eq 1 ]]; then
+        echo "  ✓ EPP: ${EPP_VALUE}"
+    else
+        echo "  → EPP: not available (VM or no intel_pstate)"
+    fi
 fi
 
 # --- Kernel Scheduler Fine-Tuning ---
@@ -2493,7 +2545,7 @@ for ra in /sys/block/*/queue/read_ahead_kb; do
     DEV=$(echo "${ra}" | cut -d/ -f4)
     [[ "${DEV}" =~ ^(loop|ram|dm-) ]] && continue
     # Skip cloud storage - already tuned above
-    [[ -n "${DISK_CLOUD[${DEV}]}" ]] && [[ "${DISK_CLOUD[${DEV}]}" != "local" ]] && continue
+    [[ -n "${DISK_CLOUD[${DEV}]:-}" ]] && [[ "${DISK_CLOUD[${DEV}]}" != "local" ]] && continue
     ROT="/sys/block/${DEV}/queue/rotational"
     if [[ -f "${ROT}" ]] && [[ "$(cat "${ROT}")" -eq 0 ]]; then
         write_value_quiet "${ra}" $((TUNE_READAHEAD / 4))
@@ -2885,8 +2937,9 @@ case ${OPT_PROFILE} in
             if command -v haveged &>/dev/null; then
                 run systemctl enable --now haveged || true
             fi
-            if [[ -c /dev/hwrng ]] && command -v rngd &>/dev/null; then
-                run systemctl enable --now rngd || true
+            # rngd service - skip on Debian/Ubuntu (uses generated transient unit)
+            if [[ -c /dev/hwrng ]] && command -v rngd &>/dev/null && [[ "${DISTRO}" =~ ^(fedora|rhel|centos|rocky|almalinux|amzn)$ ]]; then
+                run systemctl enable --now rngd 2>/dev/null || true
             fi
             echo "  ✓ Entropy: enhanced for server (was ${ENTROPY})"
         else

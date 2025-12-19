@@ -617,7 +617,7 @@ log ""
 
 # --- System Info ---
 HW_MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-HW_MEM_TOTAL_GB=$((HW_MEM_TOTAL_KB / 1024 / 1024))
+HW_MEM_TOTAL_GB=$(((HW_MEM_TOTAL_KB + 524288) / 1024 / 1024))  # Round to nearest GB
 HW_CPU_CORES=$(nproc)
 HW_IS_VM=$(systemd-detect-virt 2>/dev/null) || HW_IS_VM="none"
 
@@ -634,8 +634,13 @@ if [ "$HW_IS_VM" != "none" ]; then
 
     if [[ "$DMI_VENDOR" == *"amazon"* ]] || [[ "$DMI_PRODUCT" == *"ec2"* ]]; then
         CLOUD_PROVIDER="aws"
-        # AWS: Get instance type from IMDS
-        INSTANCE_TYPE=$(curl -sf -m1 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "")
+        # AWS: Get instance type from IMDS (try IMDSv2 first, fallback to IMDSv1)
+        TOKEN=$(curl -sf -m1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "")
+        if [ -n "$TOKEN" ]; then
+            INSTANCE_TYPE=$(curl -sf -m1 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "")
+        else
+            INSTANCE_TYPE=$(curl -sf -m1 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "")
+        fi
     elif [[ "$DMI_VENDOR" == *"microsoft"* ]] || [[ "$DMI_ASSET" == *"azure"* ]]; then
         CLOUD_PROVIDER="azure"
         # Azure: Get VM size from IMDS
@@ -737,6 +742,7 @@ for iface in /sys/class/net/*; do
 
     DRIVER=$(basename "$(readlink -f "$iface/device/driver" 2>/dev/null)" 2>/dev/null || echo "unknown")
     SPEED=$(cat "$iface/speed" 2>/dev/null || echo "?")
+    [[ "$SPEED" == "-1" ]] && SPEED="?"
     STATE=$(cat "$iface/operstate" 2>/dev/null || echo "unknown")
     DRV_VER=""
     FW_VER=""
@@ -887,23 +893,25 @@ if [[ -n "$OPT_CONGESTION" ]]; then
     TCP_CONGESTION_SOURCE="user"
 fi
 
-# Validate congestion control when applying (sysctl --system will fail hard on invalid values).
+# Best-effort: load module for selected congestion control first.
+if [[ $OPT_DRY_RUN -eq 0 ]]; then
+    modprobe "tcp_$TCP_CONGESTION" 2>/dev/null || true
+    [[ "$TCP_CONGESTION" == "bbr" ]] && modprobe tcp_bbr 2>/dev/null || true
+fi
+
+# Validate congestion control - fall back to cubic if not available
 AVAILABLE_CC=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)
 if [[ -n "$TCP_CONGESTION" && -n "$AVAILABLE_CC" ]]; then
     if ! grep -qw -- "$TCP_CONGESTION" <<<"$AVAILABLE_CC"; then
         if [[ $OPT_DRY_RUN -eq 1 || $OPT_REPORT -eq 1 ]]; then
             warn "TCP congestion control '$TCP_CONGESTION' not in available list: $AVAILABLE_CC"
-        else
+        elif [[ "$TCP_CONGESTION_SOURCE" == "user" ]]; then
             die "TCP congestion control '$TCP_CONGESTION' is not available (available: $AVAILABLE_CC)"
+        else
+            warn "TCP congestion control '$TCP_CONGESTION' not available, falling back to cubic"
+            TCP_CONGESTION="cubic"
         fi
     fi
-fi
-
-# Best-effort: load module for selected congestion control.
-# (Many algorithms are built-in; modprobe failures are ignored.)
-if [[ $OPT_DRY_RUN -eq 0 ]]; then
-    run_quiet modprobe "tcp_$TCP_CONGESTION" 2>/dev/null || true
-    [[ "$TCP_CONGESTION" == "bbr" ]] && run_quiet modprobe tcp_bbr 2>/dev/null || true
 fi
 
 # Calculate TCP memory limits
@@ -1055,7 +1063,7 @@ else
     echo "  -> IPv6: disabled/not available, skipping"
 fi
 
-[[ $OPT_DRY_RUN -eq 0 ]] && run_quiet sysctl --system
+[[ $OPT_DRY_RUN -eq 0 ]] && run_quiet sysctl --system || true
 
 echo "  ✓ TCP/IP stack: configured"
 echo "  ✓ Congestion control: $TCP_CONGESTION ($TCP_CONGESTION_SOURCE)"
@@ -1087,6 +1095,7 @@ optimize_nic() {
     COAL=$(timeout 2 ethtool -c "$IFACE" 2>/dev/null) || COAL=""
     PRIV=$(timeout 2 ethtool --show-priv-flags "$IFACE" 2>/dev/null) || PRIV=""
     SPEED=$(cat "/sys/class/net/$IFACE/speed" 2>/dev/null) || SPEED=1000
+    [[ ! "$SPEED" =~ ^[0-9]+$ ]] && SPEED=1000
     [ "$SPEED" = "-1" ] && SPEED=1000
     MTU_MAX=$(ip -d link show "$IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="maxmtu"){print $(i+1); exit}}') || MTU_MAX=$CONST_MTU_FALLBACK
     [[ "$MTU_MAX" =~ ^[0-9]+$ ]] || MTU_MAX=$CONST_MTU_FALLBACK
@@ -1130,7 +1139,7 @@ optimize_nic() {
     # Latency profile keeps default 1500 (smaller packets = faster)
     # Jumbo frames only for high-throughput scenarios with capable instances
     local MTU_CUR
-    MTU_CUR=$(cat "/sys/class/net/$IFACE/mtu" 2>/dev/null)
+    MTU_CUR=$(cat "/sys/class/net/$IFACE/mtu" 2>/dev/null) || MTU_CUR=1500
     local MTU_T=$MTU_CUR
 
     if [ "$OPT_PROFILE" != "latency" ] && [ "$OPT_LOW_LATENCY" -ne 1 ]; then
@@ -1138,10 +1147,16 @@ optimize_nic() {
             case $CLOUD_PROVIDER in
                 aws)
                     # AWS: Jumbo frames (9001) supported within same VPC/placement group
-                    case $INSTANCE_NET_PERF in
-                        ultra | high | medium) MTU_T=$CONST_MTU_AWS ;;
-                        *) MTU_T=1500 ;;
-                    esac
+                    # Enable by default for all instances unless explicitly low-tier
+                    if [ -n "$INSTANCE_NET_PERF" ]; then
+                        case $INSTANCE_NET_PERF in
+                            ultra | high | medium) MTU_T=$CONST_MTU_AWS ;;
+                            low) [[ "$MTU_CUR" =~ ^[0-9]+$ ]] && [ "$MTU_CUR" -ge 9000 ] && MTU_T=$MTU_CUR || MTU_T=1500 ;;
+                        esac
+                    else
+                        # Unknown instance type: enable jumbo frames (safe default for AWS VPC)
+                        MTU_T=$CONST_MTU_AWS
+                    fi
                     ;;
                 azure)
                     # Azure: Jumbo frames require accelerated networking
@@ -1169,7 +1184,7 @@ optimize_nic() {
                     # Alibaba: 8500 for VPC with jumbo frame support
                     case $INSTANCE_NET_PERF in
                         ultra | high | medium) MTU_T=$CONST_MTU_ALIBABA ;;
-                        *) MTU_T=1500 ;;
+                        *) [[ "$MTU_CUR" =~ ^[0-9]+$ ]] && [ "$MTU_CUR" -ge 8500 ] && MTU_T=$MTU_CUR || MTU_T=1500 ;;
                     esac
                     ;;
                 none)
@@ -1185,6 +1200,8 @@ optimize_nic() {
             if [ "$MTU_T" != "$MTU_CUR" ]; then
                 run_quiet ip link set "$IFACE" mtu "$MTU_T" 2>/dev/null &&
                     echo "    ✓ MTU: $MTU_T (was $MTU_CUR)"
+            else
+                echo "    ✓ MTU: $MTU_CUR"
             fi
         fi
     fi
@@ -1196,13 +1213,17 @@ optimize_nic() {
     run_quiet ip link set "$IFACE" txqueuelen "$TXQ" 2>/dev/null || true
 
     # --- Offloading: Enable all supported (detect from features) ---
-    for F in rx-checksumming tx-checksumming scatter-gather \
-        generic-segmentation-offload generic-receive-offload tcp-segmentation-offload; do
-        if echo "$FEAT" | grep -q "^$F: off"; then
-            run_quiet timeout 2 ethtool -K "$IFACE" ${F//-/ } on
-        fi
-    done
-    [[ "$OPT_LOW_LATENCY" -ne 1 ]] && run_quiet timeout 2 ethtool -K "$IFACE" large-receive-offload on || true
+    if [ -n "$FEAT" ]; then
+        for F in rx-checksumming tx-checksumming scatter-gather \
+            generic-segmentation-offload generic-receive-offload tcp-segmentation-offload; do
+            if echo "$FEAT" | grep -q "^$F: off"; then
+                run_quiet timeout 2 ethtool -K "$IFACE" ${F//-/ } on || true
+            fi
+        done
+    fi
+    if [ "$OPT_LOW_LATENCY" -ne 1 ]; then
+        run_quiet timeout 2 ethtool -K "$IFACE" large-receive-offload on || true
+    fi
     echo "    ✓ Offloading: enabled"
 
     # --- Coalescing: Detect adaptive support ---
@@ -1366,7 +1387,7 @@ echo "[IRQ] Configuring packet steering..."
 cpu_mask_for_cores() {
     local cores=$1
     [[ $cores -lt 1 ]] && cores=1
-    local groups, rem, mask
+    local groups rem mask
     groups=$(((cores + 31) / 32))
     rem=$((cores % 32))
     mask=""
