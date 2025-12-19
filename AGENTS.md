@@ -32,8 +32,21 @@
 
 - No automated test suite currently.
 - Minimum validation for any change:
-  - `bash -n …` for both scripts
-  - Run at least one `--dry-run` and one `--report` path to ensure output and heredocs render correctly.
+  - `bash -n …` for both scripts (syntax check)
+  - `shellcheck` for both scripts (linting)
+  - `bashate -i E006` for both scripts (style check, ignore line length)
+  - Run at least one `--dry-run` and one `--report` path to ensure output and heredocs render correctly
+- Test on multiple platforms when possible:
+  - AWS EC2 (various instance types, IMDSv2)
+  - GCP Compute Engine (e2-micro and larger)
+  - Azure VMs
+  - Bare metal / on-premises
+- Common issues to watch for:
+  - Unbound variables with `set -u` (use `${var:-}` for optional variables)
+  - Array access without checking existence (use `${array[key]:-}`)
+  - Commands that may fail with `set -e` (add `|| true` where appropriate)
+  - Integer division truncation (add rounding for GB calculations)
+  - Cloud metadata timeouts (use `-m1` timeout with curl)
 
 ## Commit & Pull Request Guidelines
 

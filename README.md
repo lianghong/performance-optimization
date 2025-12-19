@@ -169,11 +169,13 @@ The scripts automatically scale settings based on detected hardware:
 ## Cloud Support
 
 ### AWS EC2
-- Instance type detection via IMDS
+- Instance type detection via IMDSv2 (with IMDSv1 fallback)
 - EBS vs Instance Store detection and tuning
 - ENA driver optimization (LLQ, ring buffers)
 - EFA support for HPC workloads
 - Network performance tier classification
+- Jumbo frames (MTU 9001) enabled by default for VPC traffic
+- NVMe device detection with proper sysfs path handling
 
 ### Azure
 - VM size detection via IMDS
@@ -183,9 +185,10 @@ The scripts automatically scale settings based on detected hardware:
 
 ### GCP
 - Machine type detection via metadata
-- gVNIC optimization
+- gVNIC and virtio_net optimization
 - Persistent Disk vs Local SSD tuning
 - Tier_1 networking support
+- Proper handling of unknown link speeds
 
 ### Alibaba Cloud
 - Instance type detection
