@@ -1514,10 +1514,10 @@ Type=oneshot
 ExecStart=/usr/bin/env sysctl --system
 
 # Re-apply RPS CPU masks (best effort).
-ExecStart=/bin/bash -c 'cores=\$(nproc 2>/dev/null || echo 1); groups=\$(( (cores + 31) / 32 )); rem=\$(( cores % 32 )); mask=""; for ((i=0; i<groups; i++)); do if (( i==0 && rem!=0 )); then mask+=\$(printf "%08x" \$(( (1<<rem) - 1 ))); else mask+="ffffffff"; fi; (( i<groups-1 )) && mask+=","; done; for f in /sys/class/net/*/queues/rx-*/rps_cpus /sys/class/net/*/queues/tx-*/xps_cpus; do [ -f "\$f" ] && echo "\$mask" > "\$f" 2>/dev/null || true; done'
+ExecStart=/bin/bash -c 'cores=\$(nproc 2>/dev/null || echo 1); groups=\$(( (cores + 31) / 32 )); rem=\$(( cores %% 32 )); mask=""; for ((i=0; i<groups; i++)); do if (( i==0 && rem!=0 )); then mask+=\$(printf "%%08x" \$(( (1<<rem) - 1 ))); else mask+="ffffffff"; fi; (( i<groups-1 )) && mask+=","; done; for f in /sys/class/net/*/queues/rx-*/rps_cpus /sys/class/net/*/queues/tx-*/xps_cpus; do [ -f "\$f" ] && echo "\$mask" > "\$f" 2>/dev/null || true; done'
 
 # Re-enable common offloads (best effort).
-ExecStart=/bin/bash -c 'command -v ethtool >/dev/null 2>&1 || exit 0; for dev in /sys/class/net/*/device; do dev=\${dev%/device}; iface=\${dev##*/}; ethtool -K "\$iface" gro on gso on tso on >/dev/null 2>&1 || true; done'
+ExecStart=/bin/bash -c 'command -v ethtool >/dev/null 2>&1 || exit 0; for iface in \$(ls /sys/class/net/); do [ -e "/sys/class/net/\$iface/device" ] && ethtool -K "\$iface" gro on gso on tso on 2>/dev/null || true; done'
 RemainAfterExit=yes
 
 [Install]

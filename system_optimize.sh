@@ -3577,19 +3577,19 @@ Type=oneshot
 # Failures are ignored so boot can continue normally.
 
 # CPU governor (cpufreq)
-ExecStart=/bin/bash -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [[ -f "\${g}" ]] || continue; echo "${PROFILE_GOVERNOR}" > "\${g}" 2>/dev/null || true; done'
+ExecStart=/bin/bash -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f "\$g" ] || continue; echo "${PROFILE_GOVERNOR}" > "\$g" 2>/dev/null || true; done'
 
 # Intel Turbo Boost (intel_pstate): 0=enabled, 1=disabled
-ExecStart=/bin/bash -c '[[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]] && echo "${SERVICE_INTEL_NO_TURBO}" > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true'
+ExecStart=/bin/bash -c '[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ] && echo "${SERVICE_INTEL_NO_TURBO}" > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true'
 
 # AMD Boost (cpufreq/boost): 1=enabled, 0=disabled
-ExecStart=/bin/bash -c '[[ -f /sys/devices/system/cpu/cpufreq/boost ]] && echo "${SERVICE_AMD_BOOST}" > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true'
+ExecStart=/bin/bash -c '[ -f /sys/devices/system/cpu/cpufreq/boost ] && echo "${SERVICE_AMD_BOOST}" > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true'
 
 # Transparent Huge Pages (best effort)
 ExecStart=/bin/bash -c 'echo "${TUNE_THP_MODE}" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true'
 
 # Block I/O scheduler (best effort)
-ExecStart=/bin/bash -c 'for d in /sys/block/sd*/queue/scheduler /sys/block/nvme*/queue/scheduler; do [[ -f "\${d}" ]] && echo "${SERVICE_DISK_SCHED}" > "\${d}" 2>/dev/null || true; done'
+ExecStart=/bin/bash -c 'for d in /sys/block/sd*/queue/scheduler /sys/block/nvme*/queue/scheduler; do [ -f "\$d" ] && echo "${SERVICE_DISK_SCHED}" > "\$d" 2>/dev/null || true; done'
 ${LOW_LATENCY_UNIT_LINES}
 RemainAfterExit=yes
 
