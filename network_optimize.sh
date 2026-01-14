@@ -287,6 +287,18 @@ readonly CONST_GCP_NETDEV_BUDGET=600                        # Balanced for GCP w
 readonly CONST_GCP_SOMAXCONN=65535                          # High connection servers
 readonly CONST_GCP_BACKLOG=65536                            # High backlog for busy servers
 
+# --- AWS ENA-Specific Settings (per AWS official documentation) ---
+# Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ena-improve-network-latency-linux.html
+# Reference: https://github.com/amzn/amzn-drivers/blob/master/kernel/linux/ena/ENA_Linux_Best_Practices.rst
+readonly CONST_AWS_BUSY_POLL=50                              # AWS recommended busy_poll (50-70us)
+readonly CONST_AWS_BUSY_READ=50                              # AWS recommended busy_read (50-70us)
+readonly CONST_AWS_ENA_RX_USECS_LATENCY=0                    # ENA low-latency rx-usecs (disable moderation)
+readonly CONST_AWS_ENA_TX_USECS_LATENCY=0                    # ENA low-latency tx-usecs (disable moderation)
+readonly CONST_AWS_TCP_BUF_ULTRA=$((32 * 1024 * 1024))       # 32MB - for 100+ Gbps instances
+readonly CONST_AWS_TCP_BUF_HIGH=$((16 * 1024 * 1024))        # 16MB - for 25-100 Gbps instances
+readonly CONST_AWS_TCP_BUF_MEDIUM=$((8 * 1024 * 1024))       # 8MB - for 10-25 Gbps instances
+readonly CONST_AWS_MIN_FREE_KBYTES_PERCENT=2                 # 1-3% of RAM for reserved kernel memory
+
 #===============================================================================
 # PHASE 1: INITIALIZATION
 #===============================================================================
@@ -1032,6 +1044,48 @@ elif [ "$CLOUD_PROVIDER" = "gcp" ]; then
     # GCP recommends disabling slow start after idle for persistent connections
     TCP_SLOW_START_AFTER_IDLE=0
     echo "  -> GCP: Applying Google Cloud recommended network settings"
+
+# AWS-specific tuning per AWS official documentation
+# Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ena-improve-network-latency-linux.html
+# Reference: https://github.com/amzn/amzn-drivers/blob/master/kernel/linux/ena/ENA_Linux_Best_Practices.rst
+elif [ "$CLOUD_PROVIDER" = "aws" ]; then
+    # AWS tuning based on network performance tier
+    case "${INSTANCE_NET_PERF:-medium}" in
+        ultra)
+            # 100+ Gbps instances (metal, .24xlarge, etc.)
+            TCP_RMEM_MAX=$CONST_AWS_TCP_BUF_ULTRA
+            TCP_WMEM_MAX=$CONST_AWS_TCP_BUF_ULTRA
+            CORE_RMEM_MAX=$CONST_AWS_TCP_BUF_ULTRA
+            CORE_WMEM_MAX=$CONST_AWS_TCP_BUF_ULTRA
+            NETDEV_BUDGET=$CONST_NETDEV_BUDGET_HIGH
+            echo "  -> AWS Ultra: Applying high-bandwidth settings (100+ Gbps)"
+            ;;
+        high)
+            # 25-100 Gbps instances (.8xlarge, .12xlarge, .16xlarge)
+            TCP_RMEM_MAX=$CONST_AWS_TCP_BUF_HIGH
+            TCP_WMEM_MAX=$CONST_AWS_TCP_BUF_HIGH
+            CORE_RMEM_MAX=$CONST_AWS_TCP_BUF_HIGH
+            CORE_WMEM_MAX=$CONST_AWS_TCP_BUF_HIGH
+            NETDEV_BUDGET=$CONST_NETDEV_BUDGET_SERVER
+            echo "  -> AWS High: Applying high-performance settings (25-100 Gbps)"
+            ;;
+        *)
+            # Standard instances (up to 25 Gbps)
+            TCP_RMEM_MAX=$CONST_AWS_TCP_BUF_MEDIUM
+            TCP_WMEM_MAX=$CONST_AWS_TCP_BUF_MEDIUM
+            CORE_RMEM_MAX=$CONST_AWS_TCP_BUF_MEDIUM
+            CORE_WMEM_MAX=$CONST_AWS_TCP_BUF_MEDIUM
+            ;;
+    esac
+    # AWS recommends busy polling for low-latency workloads
+    BUSY_POLL=$CONST_AWS_BUSY_POLL
+    BUSY_READ=$CONST_AWS_BUSY_READ
+    # Calculate vm.min_free_kbytes (1-3% of RAM per AWS docs)
+    AWS_MIN_FREE_KBYTES=$(( HW_MEM_TOTAL_KB * CONST_AWS_MIN_FREE_KBYTES_PERCENT / 100 ))
+    # Cap at reasonable values (128MB min for large instances, 1GB max)
+    [ "$AWS_MIN_FREE_KBYTES" -lt 131072 ] && AWS_MIN_FREE_KBYTES=131072
+    [ "$AWS_MIN_FREE_KBYTES" -gt 1048576 ] && AWS_MIN_FREE_KBYTES=1048576
+    echo "  -> AWS: Applying Amazon recommended network settings"
 fi
 
 # Select congestion control
@@ -1191,13 +1245,25 @@ net.core.netdev_budget_usecs = $NETDEV_BUDGET_USECS
 # RPS/RFS global flow table (scaled by CPU cores)
 net.core.rps_sock_flow_entries = $((32768 * HW_CPU_CORES))
 
-# Busy polling (low latency / Azure)
-# Azure recommends 50µs for improved performance
+# Busy polling (low latency / cloud providers)
+# AWS recommends 50-70µs, Azure recommends 50µs for improved performance
 net.core.busy_poll = $BUSY_POLL
 net.core.busy_read = $BUSY_READ
 
 # Device poll weight for NAPI (Azure recommended: 64)
 net.core.dev_weight = $DEV_WEIGHT
+$(
+# AWS-specific: Reserve kernel memory for network packet processing
+# Reference: https://github.com/amzn/amzn-drivers/blob/master/kernel/linux/ena/ENA_Linux_Best_Practices.rst
+if [ "$CLOUD_PROVIDER" = "aws" ] && [ -n "${AWS_MIN_FREE_KBYTES:-}" ]; then
+    cat <<AWSEOF
+
+# AWS ENA: Reserved kernel memory (1-3% of RAM per AWS best practices)
+# Prevents memory pressure during high packet rates
+vm.min_free_kbytes = $AWS_MIN_FREE_KBYTES
+AWSEOF
+fi
+)
 
 #-------------------------------------------------------------------------------
 # IPv4 Settings
@@ -1433,10 +1499,13 @@ optimize_nic() {
     case $DRIVER in
         ena)
             # AWS ENA (Elastic Network Adapter)
+            # Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ena-improve-network-latency-linux.html
+            # Reference: https://github.com/amzn/amzn-drivers/blob/master/kernel/linux/ena/ENA_Linux_Best_Practices.rst
             local ENA_VER
-            ENA_VER=$(modinfo ena 2>/dev/null | awk '/^version:/{print $2}')
+            ENA_VER=$(modinfo ena 2>/dev/null | awk '/^version:/{print $2}' || echo "unknown")
 
             # LLQ (Low Latency Queue) - reduces latency by ~20µs
+            # Maps Tx submission ring to device DRAM behind PCI BAR2
             echo "$PRIV" | grep -q "enable_llq" &&
                 run_quiet timeout 2 ethtool --set-priv-flags "$IFACE" enable_llq on || true
 
@@ -1444,16 +1513,54 @@ optimize_nic() {
             echo "$PRIV" | grep -q "enable_ena_admin" &&
                 run_quiet timeout 2 ethtool --set-priv-flags "$IFACE" enable_ena_admin on || true
 
-            # Optimize ring size based on instance type (detected from max)
-            # Large instances (metal, 8xlarge+) support 16K, smaller support 1K-8K
-            local ENA_RX_MAX
-            ENA_RX_MAX=$(echo "$RING" | awk '/Pre-set/,/Current/{if(/RX:/) print $2}' | head -1)
-            if [ -n "$ENA_RX_MAX" ]; then
-                if [ "$OPT_PROFILE" = "latency" ]; then
-                    run_quiet timeout 2 ethtool -G "$IFACE" rx 256 tx 256 || true
-                elif [ "$ENA_RX_MAX" -ge 8192 ]; then
-                    run_quiet timeout 2 ethtool -G "$IFACE" rx "$ENA_RX_MAX" tx "$ENA_RX_MAX" || true
+            # Local Page Cache control (for NUMA-aware systems)
+            # LPC improves performance by caching pages locally
+            if echo "$PRIV" | grep -q "local_page_cache"; then
+                if [ "$HW_NUMA_NODES" -gt 1 ]; then
+                    # Multi-NUMA: enable LPC for better locality
+                    run_quiet timeout 2 ethtool --set-priv-flags "$IFACE" local_page_cache on || true
                 fi
+            fi
+
+            # Optimize ring size based on instance type and profile
+            # ENA supports: Rx 256-16384, Tx 256-1024 (512 with Large LLQ)
+            local ENA_RX_MAX ENA_TX_MAX ENA_RX_TARGET ENA_TX_TARGET
+            ENA_RX_MAX=$(echo "$RING" | awk '/Pre-set/,/Current/{if(/RX:/) print $2}' | head -1)
+            ENA_TX_MAX=$(echo "$RING" | awk '/Pre-set/,/Current/{if(/TX:/) print $2}' | head -1)
+            [[ -z "$ENA_TX_MAX" || ! "$ENA_TX_MAX" =~ ^[0-9]+$ ]] && ENA_TX_MAX=1024
+
+            if [ -n "$ENA_RX_MAX" ] && [[ "$ENA_RX_MAX" =~ ^[0-9]+$ ]]; then
+                if [ "$OPT_PROFILE" = "latency" ]; then
+                    # Low latency: smaller rings reduce queuing delay
+                    ENA_RX_TARGET=512
+                    ENA_TX_TARGET=512
+                    [ "$ENA_TX_TARGET" -gt "$ENA_TX_MAX" ] && ENA_TX_TARGET=$ENA_TX_MAX
+                elif [[ "${INSTANCE_NET_PERF:-medium}" =~ ^(ultra|high)$ ]]; then
+                    # High bandwidth: maximize ring buffers
+                    ENA_RX_TARGET=$ENA_RX_MAX
+                    ENA_TX_TARGET=$ENA_TX_MAX
+                else
+                    # Standard: use reasonable defaults
+                    ENA_RX_TARGET=4096
+                    [ "$ENA_RX_TARGET" -gt "$ENA_RX_MAX" ] && ENA_RX_TARGET=$ENA_RX_MAX
+                    ENA_TX_TARGET=$ENA_TX_MAX
+                fi
+                run_quiet timeout 2 ethtool -G "$IFACE" rx "$ENA_RX_TARGET" tx "$ENA_TX_TARGET" &&
+                    echo "    ✓ ENA ring buffers: RX=$ENA_RX_TARGET TX=$ENA_TX_TARGET"
+            fi
+
+            # Interrupt moderation control (per AWS best practices)
+            # Default: rx-usecs=20, tx-usecs=64
+            # Low latency: disable moderation (rx-usecs=0, tx-usecs=0)
+            # High throughput: enable adaptive mode
+            if [ "$OPT_PROFILE" = "latency" ]; then
+                # Disable interrupt moderation for minimal latency
+                run_quiet timeout 2 ethtool -C "$IFACE" adaptive-rx off rx-usecs $CONST_AWS_ENA_RX_USECS_LATENCY tx-usecs $CONST_AWS_ENA_TX_USECS_LATENCY &&
+                    echo "    ✓ ENA interrupt moderation: disabled (low-latency)"
+            elif [[ "${INSTANCE_NET_PERF:-medium}" =~ ^(ultra|high)$ ]]; then
+                # Enable adaptive mode for high interrupt rates
+                run_quiet timeout 2 ethtool -C "$IFACE" adaptive-rx on &&
+                    echo "    ✓ ENA interrupt moderation: adaptive (high-throughput)"
             fi
 
             # Enable all supported offloads
@@ -1846,6 +1953,9 @@ printf "│   %-73.73s │\n" "- netdev_max_backlog: $NETDEV_MAX_BACKLOG"
 [ "$CLOUD_PROVIDER" = "gcp" ] && printf "│   %-73.73s │\n" "- GCP: Google Cloud recommended settings applied"
 [ "$CLOUD_PROVIDER" = "gcp" ] && printf "│   %-73.73s │\n" "- GCP: tcp_slow_start_after_idle=${TCP_SLOW_START_AFTER_IDLE}"
 [[ "$CLOUD_PROVIDER" = "gcp" && "${INSTANCE_NET_PERF:-}" =~ ^(tier1|ultra)$ ]] && printf "│   %-73.73s │\n" "- GCP: Tier_1/high-bandwidth optimizations"
+[ "$CLOUD_PROVIDER" = "aws" ] && printf "│   %-73.73s │\n" "- AWS: Amazon ENA recommended settings applied"
+[ "$CLOUD_PROVIDER" = "aws" ] && printf "│   %-73.73s │\n" "- AWS: busy_poll=${BUSY_POLL}us, busy_read=${BUSY_READ}us"
+[[ "$CLOUD_PROVIDER" = "aws" && -n "${AWS_MIN_FREE_KBYTES:-}" ]] && printf "│   %-73.73s │\n" "- AWS: vm.min_free_kbytes=${AWS_MIN_FREE_KBYTES}"
 echo "├─────────────────────────────────────────────────────────────────────────────┤"
 echo "│ FILES CREATED                                                               │"
 echo "├─────────────────────────────────────────────────────────────────────────────┤"
