@@ -149,6 +149,9 @@ die() {
 # readonly SCRIPT_NAME="network-optimize"  # Unused
 readonly CFG_SYSCTL="/etc/sysctl.d/99-network-optimize.conf"
 readonly CFG_SERVICE="/etc/systemd/system/network-optimize.service"
+readonly CFG_AZURE_UDEV_RING="/etc/udev/rules.d/99-azure-ring-buffer.rules"
+readonly CFG_AZURE_UDEV_TXQ="/etc/udev/rules.d/99-azure-txqueue-len.rules"
+readonly CFG_AZURE_UDEV_QDISC="/etc/udev/rules.d/99-azure-qdisc.rules"
 
 #-------------------------------------------------------------------------------
 # Tuning Constants
@@ -250,7 +253,39 @@ readonly CONST_MTU_FALLBACK=1500   # Standard Ethernet MTU
 # net.core.busy_poll/busy_read: Microseconds to busy-poll for packets.
 # Reduces latency by avoiding interrupt overhead, but increases CPU usage.
 readonly CONST_BUSY_POLL_LATENCY=50 # 50µs - low latency profile
+readonly CONST_BUSY_POLL_AZURE=50   # 50µs - Azure recommended (per official docs)
 readonly CONST_BUSY_POLL_OFF=0      # Disabled - normal operation
+
+# --- Azure-Specific Settings (per Microsoft official documentation) ---
+# Reference: https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-optimize-network-bandwidth
+readonly CONST_AZURE_TCP_BUF=$((64 * 1024 * 1024))        # 64MB - Azure recommended tcp_rmem/wmem max
+readonly CONST_AZURE_CORE_BUF_MAX=$((128 * 1024 * 1024))  # 128MB - Azure recommended rmem_max/wmem_max
+readonly CONST_AZURE_CORE_BUF_DEFAULT=$((32 * 1024 * 1024)) # 32MB - Azure recommended rmem_default/wmem_default
+readonly CONST_AZURE_RING_BUFFER=1024                      # Azure recommended ring buffer for hv_netvsc/Mellanox
+readonly CONST_AZURE_TX_QUEUE_LEN=10000                    # Azure recommended TX queue length
+readonly CONST_AZURE_NETDEV_BUDGET=1000                    # Azure recommended netdev_budget
+readonly CONST_AZURE_SOMAXCONN=32768                       # Azure recommended somaxconn
+readonly CONST_AZURE_BACKLOG=32768                         # Azure recommended netdev_max_backlog
+readonly CONST_AZURE_DEV_WEIGHT=64                         # Azure recommended dev_weight
+readonly CONST_AZURE_OPTMEM_MAX=65535                      # Azure recommended optmem_max (65KB, up to 1MB for 100G+)
+
+# --- UDP Memory Settings ---
+# UDP memory limits for high-throughput scenarios
+readonly CONST_UDP_MEM_MAX=$((32 * 1024 * 1024))          # 32MB - UDP memory max (pages)
+readonly CONST_UDP_BUF_MIN=16384                           # 16KB - UDP buffer minimum
+
+# --- GCP-Specific Settings (per Google Cloud official documentation) ---
+# Reference: https://cloud.google.com/compute/docs/networking/tcp-optimization-for-network-performance-in-gcp-and-hybrid
+# Reference: https://cloud.google.com/compute/docs/networking/configure-vm-with-high-bandwidth-configuration
+readonly CONST_GCP_TCP_BUF_TIER1=$((128 * 1024 * 1024))    # 128MB - Tier_1 networking (100+ Gbps)
+readonly CONST_GCP_TCP_BUF_HIGH=$((64 * 1024 * 1024))      # 64MB - High bandwidth instances
+readonly CONST_GCP_TCP_BUF_MEDIUM=$((16 * 1024 * 1024))    # 16MB - Medium bandwidth
+readonly CONST_GCP_TCP_BUF_DEFAULT=$((8 * 1024 * 1024))    # 8MB - GCP default (10Gbps/30ms example)
+readonly CONST_GCP_CORE_BUF_MAX=$((128 * 1024 * 1024))     # 128MB - rmem_max/wmem_max for Tier_1
+readonly CONST_GCP_CORE_BUF_DEFAULT=$((65536))             # 64KB - GCP recommended default
+readonly CONST_GCP_NETDEV_BUDGET=600                        # Balanced for GCP workloads
+readonly CONST_GCP_SOMAXCONN=65535                          # High connection servers
+readonly CONST_GCP_BACKLOG=65536                            # High backlog for busy servers
 
 #===============================================================================
 # PHASE 1: INITIALIZATION
@@ -509,6 +544,16 @@ do_cleanup() {
     restore_or_remove "/etc/sysctl.d/99-network-optimize.conf" "$restore_dir" || true
     restore_or_remove "/etc/systemd/system/network-optimize.service" "$restore_dir" || true
 
+    # Remove Azure-specific udev rules
+    restore_or_remove "/etc/udev/rules.d/99-azure-ring-buffer.rules" "$restore_dir" || true
+    restore_or_remove "/etc/udev/rules.d/99-azure-txqueue-len.rules" "$restore_dir" || true
+    restore_or_remove "/etc/udev/rules.d/99-azure-qdisc.rules" "$restore_dir" || true
+
+    # Reload udev rules if any Azure rules were removed
+    if [ -x /usr/bin/udevadm ]; then
+        udevadm control --reload-rules 2>/dev/null || true
+    fi
+
     # Disable service
     if systemctl is-enabled network-optimize.service &>/dev/null; then
         log "  Disabling network-optimize.service..."
@@ -686,12 +731,35 @@ if [ "$HW_IS_VM" != "none" ]; then
                 ;;
             gcp)
                 # GCP: based on machine type
-                if [[ "$INSTANCE_TYPE" == *"-96"* ]] || [[ "$INSTANCE_TYPE" == *"-64"* ]] || [[ "$INSTANCE_TYPE" == "c3-"* ]]; then
-                    INSTANCE_NET_PERF="ultra"
-                elif [[ "$INSTANCE_TYPE" == *"-32"* ]] || [[ "$INSTANCE_TYPE" == *"-16"* ]]; then
-                    INSTANCE_NET_PERF="high"
+                # Reference: https://cloud.google.com/compute/docs/networking/configure-vm-with-high-bandwidth-configuration
+                # Tier_1 networking supports 100+ Gbps on: C3, C3D, C4, C4A, C4D, N2, N2D, C2, C2D, M3, Z3
+                GCP_TIER1_CAPABLE=0
+                if [[ "$INSTANCE_TYPE" =~ ^(c3|c3d|c4|c4a|c4d|n2|n2d|c2|c2d|m3|z3)- ]]; then
+                    GCP_TIER1_CAPABLE=1
+                fi
+
+                # Determine performance tier based on vCPU count and series
+                if [[ $GCP_TIER1_CAPABLE -eq 1 ]]; then
+                    # Tier_1 capable series with large vCPU counts
+                    if [[ "$INSTANCE_TYPE" == *"-96"* ]] || [[ "$INSTANCE_TYPE" == *"-128"* ]] || \
+                       [[ "$INSTANCE_TYPE" == *"-176"* ]] || [[ "$INSTANCE_TYPE" == *"-192"* ]]; then
+                        INSTANCE_NET_PERF="tier1"  # 100-200 Gbps with Tier_1 networking
+                    elif [[ "$INSTANCE_TYPE" == *"-64"* ]] || [[ "$INSTANCE_TYPE" == *"-48"* ]]; then
+                        INSTANCE_NET_PERF="ultra"  # 50-100 Gbps
+                    elif [[ "$INSTANCE_TYPE" == *"-32"* ]] || [[ "$INSTANCE_TYPE" == *"-16"* ]]; then
+                        INSTANCE_NET_PERF="high"   # 16-50 Gbps
+                    else
+                        INSTANCE_NET_PERF="medium" # Up to 16 Gbps
+                    fi
                 else
-                    INSTANCE_NET_PERF="medium"
+                    # Non-Tier_1 series (E2, N1, etc.)
+                    if [[ "$INSTANCE_TYPE" == *"-96"* ]] || [[ "$INSTANCE_TYPE" == *"-64"* ]]; then
+                        INSTANCE_NET_PERF="high"
+                    elif [[ "$INSTANCE_TYPE" == *"-32"* ]] || [[ "$INSTANCE_TYPE" == *"-16"* ]]; then
+                        INSTANCE_NET_PERF="medium"
+                    else
+                        INSTANCE_NET_PERF="low"
+                    fi
                 fi
                 ;;
             alibaba)
@@ -879,6 +947,93 @@ if [ "$OPT_PROFILE" = "vm" ] && [ -n "$INSTANCE_NET_PERF" ]; then
     echo "  -> $CLOUD_PROVIDER ($INSTANCE_TYPE): $INSTANCE_NET_PERF network tier"
 fi
 
+# Cloud provider-specific tuning based on official documentation
+# Initialize defaults first
+CORE_RMEM_MAX=$TCP_RMEM_MAX
+CORE_WMEM_MAX=$TCP_WMEM_MAX
+CORE_RMEM_DEFAULT=262144
+CORE_WMEM_DEFAULT=262144
+DEV_WEIGHT=64
+OPTMEM_MAX=65536
+TCP_SLOW_START_AFTER_IDLE=1  # Default enabled
+if [ $OPT_LOW_LATENCY -eq 1 ]; then
+    BUSY_POLL=$CONST_BUSY_POLL_LATENCY
+    BUSY_READ=$CONST_BUSY_POLL_LATENCY
+else
+    BUSY_POLL=$CONST_BUSY_POLL_OFF
+    BUSY_READ=$CONST_BUSY_POLL_OFF
+fi
+
+# Azure-specific tuning per Microsoft official documentation
+# Reference: https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-optimize-network-bandwidth
+if [ "$CLOUD_PROVIDER" = "azure" ]; then
+    # Azure recommends specific buffer sizes regardless of instance tier
+    TCP_RMEM_MAX=$CONST_AZURE_TCP_BUF
+    TCP_WMEM_MAX=$CONST_AZURE_TCP_BUF
+    CORE_RMEM_MAX=$CONST_AZURE_CORE_BUF_MAX
+    CORE_WMEM_MAX=$CONST_AZURE_CORE_BUF_MAX
+    CORE_RMEM_DEFAULT=$CONST_AZURE_CORE_BUF_DEFAULT
+    CORE_WMEM_DEFAULT=$CONST_AZURE_CORE_BUF_DEFAULT
+    NETDEV_BUDGET=$CONST_AZURE_NETDEV_BUDGET
+    SOMAXCONN=$CONST_AZURE_SOMAXCONN
+    NETDEV_MAX_BACKLOG=$CONST_AZURE_BACKLOG
+    DEV_WEIGHT=$CONST_AZURE_DEV_WEIGHT
+    OPTMEM_MAX=$CONST_AZURE_OPTMEM_MAX
+    BUSY_POLL=$CONST_BUSY_POLL_AZURE
+    BUSY_READ=$CONST_BUSY_POLL_AZURE
+    echo "  -> Azure: Applying Microsoft recommended network settings"
+
+# GCP-specific tuning per Google Cloud official documentation
+# Reference: https://cloud.google.com/compute/docs/networking/tcp-optimization-for-network-performance-in-gcp-and-hybrid
+# Reference: https://cloud.google.com/compute/docs/networking/configure-vm-with-high-bandwidth-configuration
+elif [ "$CLOUD_PROVIDER" = "gcp" ]; then
+    # GCP tuning based on network performance tier
+    case "${INSTANCE_NET_PERF:-medium}" in
+        tier1)
+            # Tier_1 networking: 100+ Gbps, large buffer sizes
+            TCP_RMEM_MAX=$CONST_GCP_TCP_BUF_TIER1
+            TCP_WMEM_MAX=$CONST_GCP_TCP_BUF_TIER1
+            CORE_RMEM_MAX=$CONST_GCP_CORE_BUF_MAX
+            CORE_WMEM_MAX=$CONST_GCP_CORE_BUF_MAX
+            NETDEV_BUDGET=$CONST_NETDEV_BUDGET_HIGH
+            SOMAXCONN=$CONST_GCP_SOMAXCONN
+            NETDEV_MAX_BACKLOG=$CONST_GCP_BACKLOG
+            echo "  -> GCP Tier_1: Applying high-bandwidth settings (100+ Gbps capable)"
+            ;;
+        ultra)
+            # High-end instances: 50-100 Gbps
+            TCP_RMEM_MAX=$CONST_GCP_TCP_BUF_HIGH
+            TCP_WMEM_MAX=$CONST_GCP_TCP_BUF_HIGH
+            CORE_RMEM_MAX=$CONST_GCP_TCP_BUF_HIGH
+            CORE_WMEM_MAX=$CONST_GCP_TCP_BUF_HIGH
+            NETDEV_BUDGET=$CONST_NETDEV_BUDGET_SERVER
+            SOMAXCONN=$CONST_GCP_SOMAXCONN
+            NETDEV_MAX_BACKLOG=$CONST_GCP_BACKLOG
+            echo "  -> GCP Ultra: Applying high-performance settings (50-100 Gbps)"
+            ;;
+        high)
+            # Mid-high instances: 16-50 Gbps
+            TCP_RMEM_MAX=$CONST_GCP_TCP_BUF_MEDIUM
+            TCP_WMEM_MAX=$CONST_GCP_TCP_BUF_MEDIUM
+            CORE_RMEM_MAX=$CONST_GCP_TCP_BUF_MEDIUM
+            CORE_WMEM_MAX=$CONST_GCP_TCP_BUF_MEDIUM
+            NETDEV_BUDGET=$CONST_GCP_NETDEV_BUDGET
+            ;;
+        *)
+            # Default GCP settings (up to 16 Gbps)
+            TCP_RMEM_MAX=$CONST_GCP_TCP_BUF_DEFAULT
+            TCP_WMEM_MAX=$CONST_GCP_TCP_BUF_DEFAULT
+            CORE_RMEM_MAX=$CONST_GCP_TCP_BUF_DEFAULT
+            CORE_WMEM_MAX=$CONST_GCP_TCP_BUF_DEFAULT
+            ;;
+    esac
+    CORE_RMEM_DEFAULT=$CONST_GCP_CORE_BUF_DEFAULT
+    CORE_WMEM_DEFAULT=$CONST_GCP_CORE_BUF_DEFAULT
+    # GCP recommends disabling slow start after idle for persistent connections
+    TCP_SLOW_START_AFTER_IDLE=0
+    echo "  -> GCP: Applying Google Cloud recommended network settings"
+fi
+
 # Select congestion control
 TCP_CONGESTION_SOURCE="auto"
 if [ $OPT_LOW_LATENCY -eq 1 ]; then
@@ -934,16 +1089,21 @@ net.ipv4.tcp_mem = $TCP_MEM_MIN $TCP_MEM_PRESSURE $TCP_MEM_MAX
 
 # TCP receive buffer: min default max
 net.ipv4.tcp_rmem = 4096 87380 $TCP_RMEM_MAX
-net.core.rmem_default = 262144
-net.core.rmem_max = $TCP_RMEM_MAX
+net.core.rmem_default = $CORE_RMEM_DEFAULT
+net.core.rmem_max = $CORE_RMEM_MAX
 
 # TCP send buffer: min default max
 net.ipv4.tcp_wmem = 4096 65536 $TCP_WMEM_MAX
-net.core.wmem_default = 262144
-net.core.wmem_max = $TCP_WMEM_MAX
+net.core.wmem_default = $CORE_WMEM_DEFAULT
+net.core.wmem_max = $CORE_WMEM_MAX
 
-# UDP buffers
-net.core.optmem_max = 65536
+# UDP memory and buffers (Azure recommended)
+net.ipv4.udp_mem = 4096 87380 $CONST_UDP_MEM_MAX
+net.ipv4.udp_rmem_min = $CONST_UDP_BUF_MIN
+net.ipv4.udp_wmem_min = $CONST_UDP_BUF_MIN
+
+# Option memory max (65KB default, up to 1MB for 100G+)
+net.core.optmem_max = $OPTMEM_MAX
 
 #-------------------------------------------------------------------------------
 # TCP Performance
@@ -1001,6 +1161,16 @@ net.ipv4.tcp_fin_timeout = 15
 # Reuse/Recycle
 net.ipv4.tcp_tw_reuse = 1
 
+# F-RTO (Forward RTO-Recovery) - disable on wired networks (Azure recommendation)
+# F-RTO is designed for wireless networks with spurious RTOs; disabling on wired
+# networks reduces unnecessary retransmission delays
+net.ipv4.tcp_frto = 0
+
+# Slow start after idle (GCP recommendation: disable for persistent connections)
+# When disabled, TCP connections maintain their congestion window after idle periods
+# This improves performance for persistent connections (HTTP/2, gRPC, databases)
+net.ipv4.tcp_slow_start_after_idle = $TCP_SLOW_START_AFTER_IDLE
+
 #-------------------------------------------------------------------------------
 # Connection Handling
 #-------------------------------------------------------------------------------
@@ -1021,9 +1191,13 @@ net.core.netdev_budget_usecs = $NETDEV_BUDGET_USECS
 # RPS/RFS global flow table (scaled by CPU cores)
 net.core.rps_sock_flow_entries = $((32768 * HW_CPU_CORES))
 
-# Busy polling (low latency)
-net.core.busy_poll = $([ $OPT_LOW_LATENCY -eq 1 ] && echo $CONST_BUSY_POLL_LATENCY || echo $CONST_BUSY_POLL_OFF)
-net.core.busy_read = $([ $OPT_LOW_LATENCY -eq 1 ] && echo $CONST_BUSY_POLL_LATENCY || echo $CONST_BUSY_POLL_OFF)
+# Busy polling (low latency / Azure)
+# Azure recommends 50µs for improved performance
+net.core.busy_poll = $BUSY_POLL
+net.core.busy_read = $BUSY_READ
+
+# Device poll weight for NAPI (Azure recommended: 64)
+net.core.dev_weight = $DEV_WEIGHT
 
 #-------------------------------------------------------------------------------
 # IPv4 Settings
@@ -1105,7 +1279,9 @@ optimize_nic() {
     local RX_MAX TX_MAX
     RX_MAX=$(echo "$RING" | awk '/Pre-set/,/Current/{if(/RX:/) print $2}' | head -1)
     TX_MAX=$(echo "$RING" | awk '/Pre-set/,/Current/{if(/TX:/) print $2}' | head -1)
-    if [ -n "$RX_MAX" ] && [ "$RX_MAX" -gt 0 ]; then
+    # Ensure TX_MAX has a value if RX_MAX does (some NICs report both, some only RX)
+    [[ -z "$TX_MAX" || ! "$TX_MAX" =~ ^[0-9]+$ ]] && TX_MAX="${RX_MAX:-0}"
+    if [ -n "$RX_MAX" ] && [[ "$RX_MAX" =~ ^[0-9]+$ ]] && [ "$RX_MAX" -gt 0 ]; then
         local SCALE=$CONST_RING_SCALE_SERVER
         case $OPT_PROFILE in
             vm) SCALE=$CONST_RING_SCALE_VM ;;
@@ -1296,24 +1472,45 @@ optimize_nic() {
             ;;
 
         virtio_net)
-            # KVM/QEMU/GCP virtio
+            # KVM/QEMU/GCP virtio (older GCP instances without gVNIC)
             run_quiet timeout 2 ethtool -K "$IFACE" rx-gro-hw on tx-nocache-copy off || true
+
             # Virtio multiqueue - ensure all queues active
-            local VQ_MAX
+            local VQ_MAX VQ_TARGET
             VQ_MAX=$(echo "$CHAN" | awk '/Pre-set/,/Current/{if(/Combined:/) print $2}' | head -1)
-            [ -n "$VQ_MAX" ] && [ "$VQ_MAX" -gt 1 ] &&
-                run_quiet timeout 2 ethtool -L "$IFACE" combined "$VQ_MAX" || true
-            echo "    ✓ Virtio: multiqueue + GRO"
+            if [ -n "$VQ_MAX" ] && [ "$VQ_MAX" -gt 1 ]; then
+                VQ_TARGET=$VQ_MAX
+                # For GCP, use all available queues for better performance
+                if [ "$CLOUD_PROVIDER" = "gcp" ]; then
+                    run_quiet timeout 2 ethtool -L "$IFACE" combined "$VQ_TARGET" &&
+                        echo "    ✓ GCP Virtio: $VQ_TARGET queues enabled"
+                else
+                    run_quiet timeout 2 ethtool -L "$IFACE" combined "$VQ_TARGET" || true
+                    echo "    ✓ Virtio: multiqueue + GRO"
+                fi
+            else
+                echo "    ✓ Virtio: GRO enabled"
+            fi
             ;;
 
         hv_netvsc)
             # Azure/Hyper-V - often paired with Mellanox VF (accelerated networking)
-            # Check for VF (SR-IOV) presence
+            # Reference: https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-optimize-network-bandwidth
+
+            # Azure recommends ring buffer size of 1024 for synthetic interface
+            run_quiet timeout 2 ethtool -G "$IFACE" rx $CONST_AZURE_RING_BUFFER tx $CONST_AZURE_RING_BUFFER &&
+                echo "    ✓ Azure ring buffers: RX=$CONST_AZURE_RING_BUFFER TX=$CONST_AZURE_RING_BUFFER"
+
+            # Azure recommends TX queue length of 10000
+            run_quiet ip link set "$IFACE" txqueuelen $CONST_AZURE_TX_QUEUE_LEN &&
+                echo "    ✓ Azure TX queue: $CONST_AZURE_TX_QUEUE_LEN"
+
+            # Check for VF (SR-IOV) presence (accelerated networking)
             local VF_IFACE
             VF_IFACE=$(find "/sys/class/net/$IFACE" -maxdepth 1 -name 'lower_*' 2>/dev/null | head -1 | xargs -r basename 2>/dev/null)
             if [ -n "$VF_IFACE" ]; then
                 echo "    -> Azure accelerated networking: VF=$VF_IFACE"
-                # Optimize the underlying VF instead
+                # Optimize the underlying VF (Mellanox) as well
                 optimize_nic "$VF_IFACE"
             else
                 run_quiet timeout 2 ethtool -K "$IFACE" lro on sg on || true
@@ -1323,16 +1520,59 @@ optimize_nic() {
 
         gve)
             # GCP gVNIC (next-gen virtual NIC)
+            # Reference: https://cloud.google.com/compute/docs/networking/using-gvnic
+            # Reference: https://cloud.google.com/compute/docs/networking/configure-vm-with-high-bandwidth-configuration
+
+            # Enable rxhash for RSS (Receive Side Scaling)
             run_quiet timeout 2 ethtool -K "$IFACE" rxhash on || true
-            # GCP supports up to 16 queues
-            local GVE_Q
+
+            # Set queues to match CPU count (gVNIC supports up to 16 queues)
+            local GVE_Q GVE_Q_TARGET
             GVE_Q=$(echo "$CHAN" | awk '/Pre-set/,/Current/{if(/Combined:/) print $2}' | head -1)
-            [ -n "$GVE_Q" ] && run_quiet timeout 2 ethtool -L "$IFACE" combined "$GVE_Q" || true
-            echo "    ✓ gVNIC: multiqueue"
+            if [ -n "$GVE_Q" ] && [ "$GVE_Q" -gt 0 ]; then
+                GVE_Q_TARGET=$GVE_Q
+                # Cap at CPU count for optimal performance
+                [ "$GVE_Q_TARGET" -gt "$HW_CPU_CORES" ] && GVE_Q_TARGET=$HW_CPU_CORES
+                # Ensure at least using available queues for high-bandwidth instances
+                if [[ "${INSTANCE_NET_PERF:-medium}" =~ ^(tier1|ultra|high)$ ]] && [ "$GVE_Q_TARGET" -lt "$GVE_Q" ]; then
+                    GVE_Q_TARGET=$GVE_Q
+                fi
+                run_quiet timeout 2 ethtool -L "$IFACE" combined "$GVE_Q_TARGET" &&
+                    echo "    ✓ gVNIC queues: $GVE_Q_TARGET/$GVE_Q (CPUs: $HW_CPU_CORES)"
+            fi
+
+            # For Tier_1/high-bandwidth instances, maximize ring buffers
+            if [[ "${INSTANCE_NET_PERF:-medium}" =~ ^(tier1|ultra)$ ]]; then
+                local GVE_RX_MAX GVE_TX_MAX
+                GVE_RX_MAX=$(echo "$RING" | awk '/Pre-set/,/Current/{if(/RX:/) print $2}' | head -1)
+                GVE_TX_MAX=$(echo "$RING" | awk '/Pre-set/,/Current/{if(/TX:/) print $2}' | head -1)
+                if [ -n "$GVE_RX_MAX" ] && [ "$GVE_RX_MAX" -gt 0 ]; then
+                    [[ -z "$GVE_TX_MAX" || ! "$GVE_TX_MAX" =~ ^[0-9]+$ ]] && GVE_TX_MAX=$GVE_RX_MAX
+                    run_quiet timeout 2 ethtool -G "$IFACE" rx "$GVE_RX_MAX" tx "$GVE_TX_MAX" &&
+                        echo "    ✓ gVNIC ring buffers: RX=$GVE_RX_MAX TX=$GVE_TX_MAX (max for Tier_1)"
+                fi
+                echo "    ✓ gVNIC: Tier_1/high-bandwidth optimizations applied"
+            else
+                echo "    ✓ gVNIC: multiqueue enabled"
+            fi
+
+            # Enable GRO for improved receive performance
+            run_quiet timeout 2 ethtool -K "$IFACE" gro on || true
             ;;
 
         mlx5_core | mlx4_en)
             # Mellanox (bare metal, Azure VF, some cloud HPC)
+            # Reference: https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-optimize-network-bandwidth
+
+            # Azure accelerated networking: apply recommended ring buffer settings
+            if [ "$CLOUD_PROVIDER" = "azure" ]; then
+                run_quiet timeout 2 ethtool -G "$IFACE" rx $CONST_AZURE_RING_BUFFER tx $CONST_AZURE_RING_BUFFER &&
+                    echo "    ✓ Azure Mellanox ring buffers: RX=$CONST_AZURE_RING_BUFFER TX=$CONST_AZURE_RING_BUFFER"
+                run_quiet ip link set "$IFACE" txqueuelen $CONST_AZURE_TX_QUEUE_LEN &&
+                    echo "    ✓ Azure Mellanox TX queue: $CONST_AZURE_TX_QUEUE_LEN"
+            fi
+
+            # CQE compression for improved performance
             echo "$PRIV" | grep -q "rx_cqe_compress" &&
                 run_quiet timeout 2 ethtool --set-priv-flags "$IFACE" rx_cqe_compress on || true
             echo "$PRIV" | grep -q "tx_cqe_compress" &&
@@ -1524,6 +1764,60 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
+# Azure-specific udev rules for persistent NIC settings
+# Reference: https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-optimize-network-bandwidth
+if [ "$CLOUD_PROVIDER" = "azure" ]; then
+    echo ""
+    echo "[AZURE] Creating udev rules for persistent NIC settings..."
+
+    # Ring buffer udev rules
+    backup_file "$CFG_AZURE_UDEV_RING"
+    write_file "$CFG_AZURE_UDEV_RING" <<'EOF'
+# Azure Network Optimization - Ring Buffer Settings
+# Auto-generated by network_optimize.sh
+# Reference: https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-optimize-network-bandwidth
+
+# Setup Accelerated Interface ring buffers (Mellanox / MANA via hv_pci)
+SUBSYSTEM=="net", DRIVERS=="hv_pci", ACTION=="add", RUN+="/usr/sbin/ethtool -G $env{INTERFACE} rx 1024 tx 1024"
+
+# Setup Synthetic interface ring buffers (hv_netvsc)
+SUBSYSTEM=="net", DRIVERS=="hv_netvsc*", ACTION=="add", RUN+="/usr/sbin/ethtool -G $env{INTERFACE} rx 1024 tx 1024"
+EOF
+    echo "  ✓ Azure ring buffer udev rules: $CFG_AZURE_UDEV_RING"
+
+    # TX queue length udev rules
+    backup_file "$CFG_AZURE_UDEV_TXQ"
+    write_file "$CFG_AZURE_UDEV_TXQ" <<'EOF'
+# Azure Network Optimization - TX Queue Length
+# Auto-generated by network_optimize.sh
+# Reference: https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-optimize-network-bandwidth
+
+# Set TX queue length to 10000 for eth* interfaces
+SUBSYSTEM=="net", ACTION=="add|change", KERNEL=="eth*", ATTR{tx_queue_len}="10000"
+EOF
+    echo "  ✓ Azure TX queue udev rules: $CFG_AZURE_UDEV_TXQ"
+
+    # Qdisc udev rules (fq for eth*, noqueue for accelerated enP* interfaces)
+    backup_file "$CFG_AZURE_UDEV_QDISC"
+    write_file "$CFG_AZURE_UDEV_QDISC" <<'EOF'
+# Azure Network Optimization - Queue Discipline (qdisc)
+# Auto-generated by network_optimize.sh
+# Reference: https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-optimize-network-bandwidth
+
+# Accelerated networking interfaces (enP*) - use noqueue for lowest latency
+ACTION=="add|change", SUBSYSTEM=="net", KERNEL=="enP*", PROGRAM="/sbin/tc qdisc replace dev $env{INTERFACE} root noqueue"
+
+# Standard eth* interfaces - use fq qdisc (works best with BBR)
+ACTION=="add|change", SUBSYSTEM=="net", KERNEL=="eth*", PROGRAM="/sbin/tc qdisc replace dev $env{INTERFACE} root fq"
+EOF
+    echo "  ✓ Azure qdisc udev rules: $CFG_AZURE_UDEV_QDISC"
+
+    # Reload udev rules
+    run udevadm control --reload-rules 2>/dev/null || true
+    run udevadm trigger --subsystem-match=net 2>/dev/null || true
+    echo "  ✓ Azure udev rules reloaded"
+fi
+
 run systemctl daemon-reload
 run systemctl enable network-optimize.service 2>/dev/null || true
 echo "  ✓ Service: network-optimize.service enabled"
@@ -1547,11 +1841,21 @@ printf "│   %-73.73s │\n" "- somaxconn: $SOMAXCONN"
 printf "│   %-73.73s │\n" "- netdev_max_backlog: $NETDEV_MAX_BACKLOG"
 [ $OPT_LOW_LATENCY -eq 1 ] && printf "│   %-73.73s │\n" "- Low-latency: busy_poll enabled"
 [ $OPT_HIGH_THROUGHPUT -eq 1 ] && printf "│   %-73.73s │\n" "- High-throughput: large buffers"
+[ "$CLOUD_PROVIDER" = "azure" ] && printf "│   %-73.73s │\n" "- Azure: Microsoft recommended settings applied"
+[ "$CLOUD_PROVIDER" = "azure" ] && printf "│   %-73.73s │\n" "- Azure: busy_poll=${BUSY_POLL}us, dev_weight=${DEV_WEIGHT}"
+[ "$CLOUD_PROVIDER" = "gcp" ] && printf "│   %-73.73s │\n" "- GCP: Google Cloud recommended settings applied"
+[ "$CLOUD_PROVIDER" = "gcp" ] && printf "│   %-73.73s │\n" "- GCP: tcp_slow_start_after_idle=${TCP_SLOW_START_AFTER_IDLE}"
+[[ "$CLOUD_PROVIDER" = "gcp" && "${INSTANCE_NET_PERF:-}" =~ ^(tier1|ultra)$ ]] && printf "│   %-73.73s │\n" "- GCP: Tier_1/high-bandwidth optimizations"
 echo "├─────────────────────────────────────────────────────────────────────────────┤"
 echo "│ FILES CREATED                                                               │"
 echo "├─────────────────────────────────────────────────────────────────────────────┤"
 printf "│   %-73s │\n" "$CFG_SYSCTL"
 printf "│   %-73s │\n" "$CFG_SERVICE"
+if [ "$CLOUD_PROVIDER" = "azure" ]; then
+    printf "│   %-73s │\n" "$CFG_AZURE_UDEV_RING"
+    printf "│   %-73s │\n" "$CFG_AZURE_UDEV_TXQ"
+    printf "│   %-73s │\n" "$CFG_AZURE_UDEV_QDISC"
+fi
 echo "└─────────────────────────────────────────────────────────────────────────────┘"
 
 # --- Rollback Instructions ---
