@@ -677,6 +677,7 @@ HW_MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 HW_MEM_TOTAL_GB=$(((HW_MEM_TOTAL_KB + 524288) / 1024 / 1024))  # Round to nearest GB
 HW_CPU_CORES=$(nproc)
 HW_IS_VM=$(systemd-detect-virt 2>/dev/null) || HW_IS_VM="none"
+HW_NUMA_NODES=$((0 + $( (ls -d /sys/devices/system/node/node* 2>/dev/null || true) | wc -l)))
 
 # --- Cloud Provider & Instance Type Detection ---
 CLOUD_PROVIDER="none"
