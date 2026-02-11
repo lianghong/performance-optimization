@@ -271,7 +271,7 @@ readonly CONST_AZURE_OPTMEM_MAX=65535                      # Azure recommended o
 
 # --- UDP Memory Settings ---
 # UDP memory limits for high-throughput scenarios
-readonly CONST_UDP_MEM_MAX=$((32 * 1024 * 1024))          # 32MB - UDP memory max (pages)
+readonly CONST_UDP_MEM_MAX=$((256 * 1024))                 # ~1GB in pages - UDP memory max
 readonly CONST_UDP_BUF_MIN=16384                           # 16KB - UDP buffer minimum
 
 # --- GCP-Specific Settings (per Google Cloud official documentation) ---
@@ -828,8 +828,9 @@ for iface in /sys/class/net/*; do
     DRV_VER=""
     FW_VER=""
     if command -v ethtool &>/dev/null; then
-        DRV_VER=$(timeout 2 ethtool -i "$IFACE" 2>/dev/null | awk -F': *' '/^version:/{print $2; exit}')
-        FW_VER=$(timeout 2 ethtool -i "$IFACE" 2>/dev/null | awk -F': *' '/^firmware-version:/{print $2; exit}')
+        _ETHTOOL_I=$(timeout 2 ethtool -i "$IFACE" 2>/dev/null) || _ETHTOOL_I=""
+        DRV_VER=$(echo "$_ETHTOOL_I" | awk -F': *' '/^version:/{print $2; exit}')
+        FW_VER=$(echo "$_ETHTOOL_I" | awk -F': *' '/^firmware-version:/{print $2; exit}')
         FW_VER=${FW_VER# }
         FW_VER=${FW_VER% }
     fi
@@ -868,7 +869,7 @@ case $OPT_PROFILE in
     server)
         TCP_RMEM_MAX=$CONST_TCP_BUF_SERVER
         TCP_WMEM_MAX=$CONST_TCP_BUF_SERVER
-        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_SERVER))
+        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_SERVER / 4))  # Convert KB to pages
         NETDEV_BUDGET=$CONST_NETDEV_BUDGET_SERVER
         NETDEV_BUDGET_USECS=8000
         SOMAXCONN=$CONST_SOMAXCONN_SERVER
@@ -877,7 +878,7 @@ case $OPT_PROFILE in
     vm)
         TCP_RMEM_MAX=$CONST_TCP_BUF_VM
         TCP_WMEM_MAX=$CONST_TCP_BUF_VM
-        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_VM))
+        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_VM / 4))  # Convert KB to pages
         NETDEV_BUDGET=$CONST_NETDEV_BUDGET_VM
         NETDEV_BUDGET_USECS=4000
         SOMAXCONN=$CONST_SOMAXCONN_VM
@@ -886,7 +887,7 @@ case $OPT_PROFILE in
     workstation)
         TCP_RMEM_MAX=$CONST_TCP_BUF_WORKSTATION
         TCP_WMEM_MAX=$CONST_TCP_BUF_WORKSTATION
-        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_WORKSTATION))
+        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_WORKSTATION / 4))  # Convert KB to pages
         NETDEV_BUDGET=$CONST_NETDEV_BUDGET_WORKSTATION
         NETDEV_BUDGET_USECS=4000
         SOMAXCONN=$CONST_SOMAXCONN_WORKSTATION
@@ -895,7 +896,7 @@ case $OPT_PROFILE in
     laptop)
         TCP_RMEM_MAX=$CONST_TCP_BUF_LAPTOP
         TCP_WMEM_MAX=$CONST_TCP_BUF_LAPTOP
-        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_LAPTOP))
+        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_LAPTOP / 4))  # Convert KB to pages
         NETDEV_BUDGET=$CONST_NETDEV_BUDGET_LAPTOP
         NETDEV_BUDGET_USECS=2000
         SOMAXCONN=$CONST_SOMAXCONN_LAPTOP
@@ -904,7 +905,7 @@ case $OPT_PROFILE in
     latency)
         TCP_RMEM_MAX=$CONST_TCP_BUF_LATENCY
         TCP_WMEM_MAX=$CONST_TCP_BUF_LATENCY
-        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_LAPTOP))
+        TCP_MEM_MAX=$((HW_MEM_TOTAL_KB / CONST_TCP_MEM_FRAC_LAPTOP / 4))  # Convert KB to pages
         NETDEV_BUDGET=$CONST_NETDEV_BUDGET_LATENCY
         NETDEV_BUDGET_USECS=500
         SOMAXCONN=$CONST_SOMAXCONN_LATENCY
@@ -924,7 +925,7 @@ fi
 # Cloud VM: Tune based on detected instance network performance tier
 if [ "$OPT_PROFILE" = "vm" ] && [ -n "$INSTANCE_NET_PERF" ]; then
     case $INSTANCE_NET_PERF in
-        ultra) # 100-200 Gbps instances
+        ultra|tier1) # 100-200 Gbps instances
             TCP_RMEM_MAX=$CONST_TCP_BUF_HIGH_THROUGHPUT
             TCP_WMEM_MAX=$CONST_TCP_BUF_HIGH_THROUGHPUT
             NETDEV_BUDGET=$CONST_NETDEV_BUDGET_HIGH
@@ -1079,8 +1080,10 @@ elif [ "$CLOUD_PROVIDER" = "aws" ]; then
             ;;
     esac
     # AWS recommends busy polling for low-latency workloads
-    BUSY_POLL=$CONST_AWS_BUSY_POLL
-    BUSY_READ=$CONST_AWS_BUSY_READ
+    if [[ "$OPT_LOW_LATENCY" -eq 1 ]] || [[ "${INSTANCE_NET_PERF:-}" =~ ^(ultra|high)$ ]]; then
+        BUSY_POLL=$CONST_AWS_BUSY_POLL
+        BUSY_READ=$CONST_AWS_BUSY_READ
+    fi
     # Calculate vm.min_free_kbytes (1-3% of RAM per AWS docs)
     AWS_MIN_FREE_KBYTES=$(( HW_MEM_TOTAL_KB * CONST_AWS_MIN_FREE_KBYTES_PERCENT / 100 ))
     # Cap at reasonable values (128MB min for large instances, 1GB max)
@@ -1105,8 +1108,12 @@ fi
 
 # Best-effort: load module for selected congestion control first.
 if [[ $OPT_DRY_RUN -eq 0 ]]; then
-    modprobe "tcp_$TCP_CONGESTION" 2>/dev/null || true
-    [[ "$TCP_CONGESTION" == "bbr" ]] && modprobe tcp_bbr 2>/dev/null || true
+    if [[ "$TCP_CONGESTION" =~ ^[a-z0-9_]+$ ]]; then
+        modprobe "tcp_${TCP_CONGESTION}" 2>/dev/null || true
+    fi
+    if [[ "$TCP_CONGESTION" == "bbr" ]]; then
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
 fi
 
 # Validate congestion control - fall back to cubic if not available
@@ -1185,16 +1192,12 @@ net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
-net.ipv4.tcp_fack = 1
 
 # Fast Open
 net.ipv4.tcp_fastopen = 3
 
 # MTU probing (disable for latency - adds delay)
 net.ipv4.tcp_mtu_probing = $([ $OPT_LOW_LATENCY -eq 1 ] && echo 0 || echo 1)
-
-# Low latency TCP
-net.ipv4.tcp_low_latency = $([ $OPT_LOW_LATENCY -eq 1 ] && echo 1 || echo 0)
 
 # Keepalive
 net.ipv4.tcp_keepalive_time = 600
@@ -1259,8 +1262,9 @@ $(
 if [ "$CLOUD_PROVIDER" = "aws" ] && [ -n "${AWS_MIN_FREE_KBYTES:-}" ]; then
     cat <<AWSEOF
 
-# AWS ENA: Reserved kernel memory (1-3% of RAM per AWS best practices)
-# Prevents memory pressure during high packet rates
+# NOTE: vm.min_free_kbytes is a VM subsystem setting, kept here per AWS networking
+# best practices to ensure sufficient free memory for network buffer allocation.
+# Reference: https://github.com/amzn/amzn-drivers/blob/master/kernel/linux/ena/ENA_Linux_Best_Practices.rst
 vm.min_free_kbytes = $AWS_MIN_FREE_KBYTES
 AWSEOF
 fi
@@ -1286,6 +1290,10 @@ net.ipv4.neigh.default.gc_thresh2 = 4096
 net.ipv4.neigh.default.gc_thresh3 = 8192
 EOF
 
+# Append deprecated sysctls only if they exist in this kernel
+[[ -f /proc/sys/net/ipv4/tcp_fack ]] && echo "net.ipv4.tcp_fack = 1" | append_file "$CFG_SYSCTL"
+[[ -f /proc/sys/net/ipv4/tcp_low_latency ]] && echo "net.ipv4.tcp_low_latency = $([ $OPT_LOW_LATENCY -eq 1 ] && echo 1 || echo 0)" | append_file "$CFG_SYSCTL"
+
 # IPv6: Only configure if enabled in kernel
 if [ -d /proc/sys/net/ipv6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" != "1" ]; then
     append_file "$CFG_SYSCTL" <<'EOF'
@@ -1293,18 +1301,24 @@ if [ -d /proc/sys/net/ipv6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv
 #-------------------------------------------------------------------------------
 # IPv6 Settings
 #-------------------------------------------------------------------------------
-net.ipv6.conf.all.accept_ra = 0
-net.ipv6.conf.default.accept_ra = 0
 net.ipv6.neigh.default.gc_thresh1 = 1024
 net.ipv6.neigh.default.gc_thresh2 = 4096
 net.ipv6.neigh.default.gc_thresh3 = 8192
 EOF
+    if [ "${CLOUD_PROVIDER:-none}" = "none" ]; then
+        echo "net.ipv6.conf.all.accept_ra = 0" | append_file "$CFG_SYSCTL"
+        echo "net.ipv6.conf.default.accept_ra = 0" | append_file "$CFG_SYSCTL"
+    else
+        echo "# Skipping RA disable on cloud (IPv6 SLAAC required)" | append_file "$CFG_SYSCTL"
+    fi
     echo "  ✓ IPv6: configured"
 else
     echo "  -> IPv6: disabled/not available, skipping"
 fi
 
-[[ $OPT_DRY_RUN -eq 0 ]] && run_quiet sysctl --system || true
+if [[ $OPT_DRY_RUN -eq 0 ]]; then
+    run_quiet sysctl --system || true
+fi
 
 echo "  ✓ TCP/IP stack: configured"
 echo "  ✓ Congestion control: $TCP_CONGESTION ($TCP_CONGESTION_SOURCE)"
@@ -1337,7 +1351,6 @@ optimize_nic() {
     PRIV=$(timeout 2 ethtool --show-priv-flags "$IFACE" 2>/dev/null) || PRIV=""
     SPEED=$(cat "/sys/class/net/$IFACE/speed" 2>/dev/null) || SPEED=1000
     [[ ! "$SPEED" =~ ^[0-9]+$ ]] && SPEED=1000
-    [ "$SPEED" = "-1" ] && SPEED=1000
     MTU_MAX=$(ip -d link show "$IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="maxmtu"){print $(i+1); exit}}') || MTU_MAX=$CONST_MTU_FALLBACK
     [[ "$MTU_MAX" =~ ^[0-9]+$ ]] || MTU_MAX=$CONST_MTU_FALLBACK
 
@@ -1369,7 +1382,7 @@ optimize_nic() {
     # --- Queues: Match to CPU cores (latency uses all for parallelism) ---
     local Q_MAX
     Q_MAX=$(echo "$CHAN" | awk '/Pre-set/,/Current/{if(/Combined:/) print $2}' | head -1)
-    if [ -n "$Q_MAX" ] && [ "$Q_MAX" -gt 1 ]; then
+    if [ -n "$Q_MAX" ] && [[ "$Q_MAX" =~ ^[0-9]+$ ]] && [ "$Q_MAX" -gt 1 ]; then
         local Q_T=$Q_MAX
         [ "$Q_T" -gt "$HW_CPU_CORES" ] && Q_T=$HW_CPU_CORES
         [ "$OPT_PROFILE" = "laptop" ] && Q_T=$((Q_T / 2))
@@ -1457,10 +1470,19 @@ optimize_nic() {
 
     # --- Offloading: Enable all supported (detect from features) ---
     if [ -n "$FEAT" ]; then
-        for F in rx-checksumming tx-checksumming scatter-gather \
-            generic-segmentation-offload generic-receive-offload tcp-segmentation-offload; do
-            if echo "$FEAT" | grep -q "^$F: off"; then
-                run_quiet timeout 2 ethtool -K "$IFACE" ${F//-/ } on || true
+        # Map ethtool display names to -K short names
+        local -A _FEAT_MAP=(
+            [rx-checksumming]=rx
+            [tx-checksumming]=tx
+            [scatter-gather]=sg
+            [generic-segmentation-offload]=gso
+            [generic-receive-offload]=gro
+            [tcp-segmentation-offload]=tso
+        )
+        local _F
+        for _F in "${!_FEAT_MAP[@]}"; do
+            if echo "$FEAT" | grep -q "^${_F}: off"; then
+                run_quiet timeout 2 ethtool -K "$IFACE" "${_FEAT_MAP[$_F]}" on || true
             fi
         done
     fi
@@ -1494,7 +1516,9 @@ optimize_nic() {
     fi
 
     # --- Flow Control ---
-    [ "$OPT_PROFILE" = "server" ] && run_quiet timeout 2 ethtool -A "$IFACE" rx on tx on || true
+    if [ "$OPT_PROFILE" = "server" ]; then
+        run_quiet timeout 2 ethtool -A "$IFACE" rx on tx on || true
+    fi
 
     # --- Driver-specific optimizations ---
     case $DRIVER in
@@ -1581,12 +1605,13 @@ optimize_nic() {
 
         virtio_net)
             # KVM/QEMU/GCP virtio (older GCP instances without gVNIC)
-            run_quiet timeout 2 ethtool -K "$IFACE" rx-gro-hw on tx-nocache-copy off || true
+            run_quiet timeout 2 ethtool -K "$IFACE" rx-gro-hw on || true
+            run_quiet timeout 2 ethtool -K "$IFACE" tx-nocache-copy off || true
 
             # Virtio multiqueue - ensure all queues active
             local VQ_MAX VQ_TARGET
             VQ_MAX=$(echo "$CHAN" | awk '/Pre-set/,/Current/{if(/Combined:/) print $2}' | head -1)
-            if [ -n "$VQ_MAX" ] && [ "$VQ_MAX" -gt 1 ]; then
+            if [ -n "$VQ_MAX" ] && [[ "$VQ_MAX" =~ ^[0-9]+$ ]] && [ "$VQ_MAX" -gt 1 ]; then
                 VQ_TARGET=$VQ_MAX
                 # For GCP, use all available queues for better performance
                 if [ "$CLOUD_PROVIDER" = "gcp" ]; then
@@ -1616,6 +1641,7 @@ optimize_nic() {
             # Check for VF (SR-IOV) presence (accelerated networking)
             local VF_IFACE
             VF_IFACE=$(find "/sys/class/net/$IFACE" -maxdepth 1 -name 'lower_*' 2>/dev/null | head -1 | xargs -r basename 2>/dev/null)
+            VF_IFACE="${VF_IFACE#lower_}"
             if [ -n "$VF_IFACE" ]; then
                 echo "    -> Azure accelerated networking: VF=$VF_IFACE"
                 # Optimize the underlying VF (Mellanox) as well
@@ -1637,7 +1663,7 @@ optimize_nic() {
             # Set queues to match CPU count (gVNIC supports up to 16 queues)
             local GVE_Q GVE_Q_TARGET
             GVE_Q=$(echo "$CHAN" | awk '/Pre-set/,/Current/{if(/Combined:/) print $2}' | head -1)
-            if [ -n "$GVE_Q" ] && [ "$GVE_Q" -gt 0 ]; then
+            if [ -n "$GVE_Q" ] && [[ "$GVE_Q" =~ ^[0-9]+$ ]] && [ "$GVE_Q" -gt 0 ]; then
                 GVE_Q_TARGET=$GVE_Q
                 # Cap at CPU count for optimal performance
                 [ "$GVE_Q_TARGET" -gt "$HW_CPU_CORES" ] && GVE_Q_TARGET=$HW_CPU_CORES
@@ -1654,7 +1680,7 @@ optimize_nic() {
                 local GVE_RX_MAX GVE_TX_MAX
                 GVE_RX_MAX=$(echo "$RING" | awk '/Pre-set/,/Current/{if(/RX:/) print $2}' | head -1)
                 GVE_TX_MAX=$(echo "$RING" | awk '/Pre-set/,/Current/{if(/TX:/) print $2}' | head -1)
-                if [ -n "$GVE_RX_MAX" ] && [ "$GVE_RX_MAX" -gt 0 ]; then
+                if [ -n "$GVE_RX_MAX" ] && [[ "$GVE_RX_MAX" =~ ^[0-9]+$ ]] && [ "$GVE_RX_MAX" -gt 0 ]; then
                     [[ -z "$GVE_TX_MAX" || ! "$GVE_TX_MAX" =~ ^[0-9]+$ ]] && GVE_TX_MAX=$GVE_RX_MAX
                     run_quiet timeout 2 ethtool -G "$IFACE" rx "$GVE_RX_MAX" tx "$GVE_TX_MAX" &&
                         echo "    ✓ gVNIC ring buffers: RX=$GVE_RX_MAX TX=$GVE_TX_MAX (max for Tier_1)"
@@ -1703,7 +1729,9 @@ optimize_nic() {
             run_quiet timeout 2 ethtool -K "$IFACE" rxhash on || true
             local ALI_Q
             ALI_Q=$(echo "$CHAN" | awk '/Pre-set/,/Current/{if(/Combined:/) print $2}' | head -1)
-            [ -n "$ALI_Q" ] && run_quiet timeout 2 ethtool -L "$IFACE" combined "$ALI_Q" || true
+            if [ -n "$ALI_Q" ] && [[ "$ALI_Q" =~ ^[0-9]+$ ]]; then
+                run_quiet timeout 2 ethtool -L "$IFACE" combined "$ALI_Q" || true
+            fi
             echo "    ✓ Alibaba eRDMA: multiqueue"
             ;;
     esac

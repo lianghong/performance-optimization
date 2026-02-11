@@ -127,6 +127,10 @@
 #===============================================================================
 
 set -euo pipefail
+if [[ ${BASH_VERSINFO[0]} -lt 4 ]]; then
+    echo "ERROR: Bash 4.0+ required (found ${BASH_VERSION})" >&2
+    exit 1
+fi
 IFS=$'\n\t'
 umask 022
 
@@ -142,11 +146,12 @@ die() {
 verbose() { [[ ${OPT_VERBOSE:-0} -eq 1 ]] && printf 'VERBOSE: %s\n' "$*" >&2 || true; }
 
 # Timing helpers for verbose mode
-_timer_start() { [[ ${OPT_VERBOSE:-0} -eq 1 ]] && _TIMER_START=$(date +%s%3N) || true; }
+_timer_start() { [[ ${OPT_VERBOSE:-0} -eq 1 ]] && _TIMER_START=$(date +%s%N 2>/dev/null | cut -c1-13 || echo $(($(date +%s) * 1000))) || true; }
 _timer_end() {
     [[ ${OPT_VERBOSE:-0} -eq 1 ]] && {
-        local elapsed
-        elapsed=$(($(date +%s%3N) - _TIMER_START))
+        local elapsed _now
+        _now=$(date +%s%N 2>/dev/null | cut -c1-13 || echo $(($(date +%s) * 1000)))
+        elapsed=$((_now - _TIMER_START))
         verbose "$1 completed in ${elapsed}ms"
     } || true
 }
@@ -255,7 +260,7 @@ readonly CFG_SYSTEMD_USER="/etc/systemd/user.conf.d/99-system-optimize.conf"
 readonly CFG_MODPROBE="/etc/modprobe.d/99-system-optimize-blacklist.conf"
 readonly CFG_JOURNALD="/etc/systemd/journald.conf.d/99-system-optimize.conf"
 readonly CFG_SERVICE="/etc/systemd/system/system-optimize.service"
-readonly CFG_FSTAB_HINTS="/tmp/system-optimize-fstab.txt"
+CFG_FSTAB_HINTS=""  # Set later via mktemp when needed
 readonly CFG_GRUB_BACKUP="/etc/default/grub.bak.system-optimize"
 
 #-------------------------------------------------------------------------------
@@ -590,36 +595,7 @@ write_value_quiet() {
     write_value "$1" "$2" 2>/dev/null || true
 }
 
-# Write with verification - for critical sysfs/procfs settings
-safe_write() {
-    local path=$1
-    local value=$2
-    local desc=${3:-${path}}
-    if [[ ${OPT_DRY_RUN} -eq 1 ]]; then
-        [[ ${OPT_REPORT} -eq 1 ]] && return 0
-        printf '[DRY-RUN] write %s <= %s (%s)\n' "${path}" "${value}" "${desc}"
-        return 0
-    fi
-    if [[ ! -e "${path}" ]]; then
-        verbose "Path does not exist: ${path}"
-        return 1
-    fi
-    if ! printf '%s\n' "${value}" >"${path}" 2>/dev/null; then
-        warn "Failed to write to ${path} (${desc})"
-        return 1
-    fi
-    # Verify write succeeded (sysfs/procfs can silently reject values)
-    local actual
-    actual=$(cat "${path}" 2>/dev/null) || actual=""
-    # Trim whitespace for comparison
-    actual="${actual%% *}"
-    if [[ "${actual}" != "${value}" ]]; then
-        verbose "Write verification: ${path} expected '${value}', got '${actual}'"
-        return 1
-    fi
-    verbose "✓ ${desc}: ${value}"
-    return 0
-}
+
 
 # Write/append file content from stdin (respects --dry-run)
 write_file() {
@@ -778,7 +754,7 @@ fi
 
 # Staging area for sysctl snippets collected during runtime tuning
 SYSCTL_SNIPPETS_FILE=$(mktemp -p /tmp system-optimize-sysctl.XXXXXX)
-trap 'rm -f "${SYSCTL_SNIPPETS_FILE}" 2>/dev/null || true' EXIT
+trap 'rm -f "${SYSCTL_SNIPPETS_FILE}" "${CFG_FSTAB_HINTS}" 2>/dev/null || true' EXIT
 
 # --- Distribution Detection ---
 # shellcheck source=/dev/null
@@ -913,7 +889,8 @@ HW_CPU_CORES=$(nproc)
 
 # --- Memory Detection ---
 HW_MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-HW_MEM_TOTAL_GB=$((HW_MEM_TOTAL_KB / 1024 / 1024))
+HW_MEM_TOTAL_GB=$(( (HW_MEM_TOTAL_KB + 1048575) / 1024 / 1024 ))
+[[ ${HW_MEM_TOTAL_GB} -lt 1 ]] && HW_MEM_TOTAL_GB=1
 
 # --- Topology Detection ---
 HW_NUMA_NODES=$((0 + $( (ls -d /sys/devices/system/node/node* 2>/dev/null || true) | wc -l)))
@@ -940,14 +917,11 @@ CLOUD_CONFIDENCE="" # high/medium/low
 imds_fetch() {
     local url=$1 header=${2:-}
     local result=""
-    for _attempt in 1 2; do
-        if [[ -n "${header}" ]]; then
-            result=$(timeout 2 curl -sf -H "${header}" "${url}" 2>/dev/null) && break
-        else
-            result=$(timeout 2 curl -sf "${url}" 2>/dev/null) && break
-        fi
-        sleep 0.5
-    done
+    if [[ -n "${header}" ]]; then
+        result=$(timeout 1 curl -sf -H "${header}" "${url}" 2>/dev/null) || true
+    else
+        result=$(timeout 1 curl -sf "${url}" 2>/dev/null) || true
+    fi
     echo "${result}"
 }
 
@@ -973,7 +947,8 @@ if [[ "${HW_IS_VM}" != "none" ]]; then
     fi
 
     # Method 2: IMDS probing (if DMI didn't identify provider)
-    if [[ "${CLOUD_PROVIDER}" == "none" ]]; then
+    # Skip if DMI was readable but didn't match any known cloud vendor
+    if [[ "${CLOUD_PROVIDER}" == "none" ]] && [[ -z "${DMI_VENDOR:-}" ]]; then
         if imds_fetch "http://169.254.169.254/latest/meta-data/" | grep -q ami-id 2>/dev/null; then
             CLOUD_PROVIDER="aws"
             CLOUD_DETECTION_METHOD="imds"
@@ -1043,11 +1018,14 @@ _timer_end "Cloud detection"
 # Detection priority: VM > laptop > workstation > server
 # Workstation indicators: display server, desktop environment, audio, graphical target
 _is_workstation() {
-    [[ -n "${DISPLAY}" ]] || [[ -n "${WAYLAND_DISPLAY}" ]] ||
+    [[ -n "${DISPLAY:-}" ]] || [[ -n "${WAYLAND_DISPLAY:-}" ]] ||
         systemctl get-default 2>/dev/null | grep -q graphical ||
         [[ -d /run/user/"$(id -u)"/pulse ]] ||
-        pgrep -x "gnome-shell|plasmashell|xfce4-session|cinnamon|mate-session" \
-            >/dev/null 2>&1
+        pgrep -x "gnome-shell" >/dev/null 2>&1 ||
+        pgrep -x "plasmashell" >/dev/null 2>&1 ||
+        pgrep -x "xfce4-session" >/dev/null 2>&1 ||
+        pgrep -x "cinnamon" >/dev/null 2>&1 ||
+        pgrep -x "mate-session" >/dev/null 2>&1
 }
 
 if [[ "${OPT_PROFILE}" = "auto" ]]; then
@@ -1202,38 +1180,40 @@ echo "├───────────────────────�
 printf "│ %-75.75s │\n" "Profile: ${OPT_PROFILE} (governor=${PROFILE_GOVERNOR}, THP=${PROFILE_THP})"
 if [[ "${CLOUD_PROVIDER}" != "none" ]]; then
     printf "│ %-75.75s │\n" "Cloud: ${CLOUD_PROVIDER} | Instance: ${INSTANCE_TYPE:-unknown}"
-    # Fetch additional cloud metadata
-    case ${CLOUD_PROVIDER} in
-        aws)
-            _aws_az=$(imds_fetch "http://169.254.169.254/latest/meta-data/placement/availability-zone")
-            _aws_ami=$(imds_fetch "http://169.254.169.254/latest/meta-data/ami-id")
-            _aws_id=$(imds_fetch "http://169.254.169.254/latest/meta-data/instance-id")
-            [[ -n "${_aws_az}" ]] && printf "│ %-75.75s │\n" "  AZ: ${_aws_az} | AMI: ${_aws_ami:-n/a}"
-            [[ -n "${_aws_id}" ]] && printf "│ %-75.75s │\n" "  Instance ID: ${_aws_id}"
-            ;;
-        azure)
-            _az_loc=$(imds_fetch "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text" "Metadata:true")
-            _az_rg=$(imds_fetch "http://169.254.169.254/metadata/instance/compute/resourceGroupName?api-version=2021-02-01&format=text" "Metadata:true")
-            _az_id=$(imds_fetch "http://169.254.169.254/metadata/instance/compute/vmId?api-version=2021-02-01&format=text" "Metadata:true")
-            [[ -n "${_az_loc}" ]] && printf "│ %-75.75s │\n" "  Location: ${_az_loc} | RG: ${_az_rg:-n/a}"
-            [[ -n "${_az_id}" ]] && printf "│ %-75.75s │\n" "  VM ID: ${_az_id}"
-            ;;
-        gcp)
-            _gcp_zone=$(imds_fetch "http://169.254.169.254/computeMetadata/v1/instance/zone" "Metadata-Flavor: Google")
-            _gcp_zone=${_gcp_zone##*/}
-            _gcp_id=$(imds_fetch "http://169.254.169.254/computeMetadata/v1/instance/id" "Metadata-Flavor: Google")
-            _gcp_proj=$(imds_fetch "http://169.254.169.254/computeMetadata/v1/project/project-id" "Metadata-Flavor: Google")
-            [[ -n "${_gcp_zone}" ]] && printf "│ %-75.75s │\n" "  Zone: ${_gcp_zone} | Project: ${_gcp_proj:-n/a}"
-            [[ -n "${_gcp_id}" ]] && printf "│ %-75.75s │\n" "  Instance ID: ${_gcp_id}"
-            ;;
-        alibaba)
-            _ali_zone=$(imds_fetch "http://100.100.100.200/latest/meta-data/zone-id")
-            _ali_region=$(imds_fetch "http://100.100.100.200/latest/meta-data/region-id")
-            _ali_id=$(imds_fetch "http://100.100.100.200/latest/meta-data/instance-id")
-            [[ -n "${_ali_region}" ]] && printf "│ %-75.75s │\n" "  Region: ${_ali_region} | Zone: ${_ali_zone:-n/a}"
-            [[ -n "${_ali_id}" ]] && printf "│ %-75.75s │\n" "  Instance ID: ${_ali_id}"
-            ;;
-    esac
+    # Fetch additional cloud metadata (skip in dry-run/report mode)
+    if [[ ${OPT_DRY_RUN} -eq 0 ]]; then
+        case ${CLOUD_PROVIDER} in
+            aws)
+                _aws_az=$(imds_fetch "http://169.254.169.254/latest/meta-data/placement/availability-zone")
+                _aws_ami=$(imds_fetch "http://169.254.169.254/latest/meta-data/ami-id")
+                _aws_id=$(imds_fetch "http://169.254.169.254/latest/meta-data/instance-id")
+                [[ -n "${_aws_az}" ]] && printf "│ %-75.75s │\n" "  AZ: ${_aws_az} | AMI: ${_aws_ami:-n/a}"
+                [[ -n "${_aws_id}" ]] && printf "│ %-75.75s │\n" "  Instance ID: ${_aws_id}"
+                ;;
+            azure)
+                _az_loc=$(imds_fetch "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text" "Metadata:true")
+                _az_rg=$(imds_fetch "http://169.254.169.254/metadata/instance/compute/resourceGroupName?api-version=2021-02-01&format=text" "Metadata:true")
+                _az_id=$(imds_fetch "http://169.254.169.254/metadata/instance/compute/vmId?api-version=2021-02-01&format=text" "Metadata:true")
+                [[ -n "${_az_loc}" ]] && printf "│ %-75.75s │\n" "  Location: ${_az_loc} | RG: ${_az_rg:-n/a}"
+                [[ -n "${_az_id}" ]] && printf "│ %-75.75s │\n" "  VM ID: ${_az_id}"
+                ;;
+            gcp)
+                _gcp_zone=$(imds_fetch "http://169.254.169.254/computeMetadata/v1/instance/zone" "Metadata-Flavor: Google")
+                _gcp_zone=${_gcp_zone##*/}
+                _gcp_id=$(imds_fetch "http://169.254.169.254/computeMetadata/v1/instance/id" "Metadata-Flavor: Google")
+                _gcp_proj=$(imds_fetch "http://169.254.169.254/computeMetadata/v1/project/project-id" "Metadata-Flavor: Google")
+                [[ -n "${_gcp_zone}" ]] && printf "│ %-75.75s │\n" "  Zone: ${_gcp_zone} | Project: ${_gcp_proj:-n/a}"
+                [[ -n "${_gcp_id}" ]] && printf "│ %-75.75s │\n" "  Instance ID: ${_gcp_id}"
+                ;;
+            alibaba)
+                _ali_zone=$(imds_fetch "http://100.100.100.200/latest/meta-data/zone-id")
+                _ali_region=$(imds_fetch "http://100.100.100.200/latest/meta-data/region-id")
+                _ali_id=$(imds_fetch "http://100.100.100.200/latest/meta-data/instance-id")
+                [[ -n "${_ali_region}" ]] && printf "│ %-75.75s │\n" "  Region: ${_ali_region} | Zone: ${_ali_zone:-n/a}"
+                [[ -n "${_ali_id}" ]] && printf "│ %-75.75s │\n" "  Instance ID: ${_ali_id}"
+                ;;
+        esac
+    fi
 fi
 printf "│ %-75.75s │\n" "CPU: ${HW_CPU_MODEL}"
 printf "│ %-75.75s │\n" "Vendor: ${HW_CPU_VENDOR} | Cores: ${HW_CPU_CORES} | SMT: ${HW_SMT_ACTIVE} (threads/core: ${HW_THREADS_PER_CORE})"
@@ -1430,7 +1410,7 @@ for svc_info in "${SERVICES_CHECK_ALL[@]}"; do
     # DESC=$(echo "$svc_info" | cut -d: -f2) # Unused
     MEM=$(echo "${svc_info}" | cut -d: -f3)
     PROFILES=$(echo "${svc_info}" | cut -d: -f4)
-    MEM_NUM=$(echo "${MEM}" | grep -oP '\d+')
+    MEM_NUM=$(echo "${MEM}" | grep -oE '[0-9]+')
 
     # Only check if this service is non-essential for current profile
     if [[ "${PROFILES}" == *"${PROFILE_LETTER}"* ]]; then
@@ -1455,11 +1435,7 @@ echo "├───────────────────────�
 
 # Current memory stats
 MEM_TOTAL=$((HW_MEM_TOTAL_KB / 1024))
-MEM_AVAIL=$(grep MemAvailable /proc/meminfo | awk '{print int($2/1024)}')
-# MEM_FREE=$(grep "^MemFree:" /proc/meminfo | awk '{print int($2/1024)}') # Unused
-MEM_BUFFERS=$(grep "^Buffers:" /proc/meminfo | awk '{print int($2/1024)}')
-MEM_CACHED=$(grep "^Cached:" /proc/meminfo | awk '{print int($2/1024)}')
-MEM_SLAB=$(grep "^Slab:" /proc/meminfo | awk '{print int($2/1024)}')
+eval "$(awk '/^MemAvailable:/{printf "MEM_AVAIL=%d\n",int($2/1024)} /^Buffers:/{printf "MEM_BUFFERS=%d\n",int($2/1024)} /^Cached:/{printf "MEM_CACHED=%d\n",int($2/1024)} /^Slab:/{printf "MEM_SLAB=%d\n",int($2/1024)}' /proc/meminfo)"
 MEM_USED=$((MEM_TOTAL - MEM_AVAIL))
 
 printf "│ %-20.20s %-54.54s │\n" "Total:" "${MEM_TOTAL}MB"
@@ -1471,7 +1447,7 @@ printf "│ %-20.20s %-54.54s │\n" "Slab cache:" "${MEM_SLAB}MB (kernel object
 # Check for memory optimization opportunities
 MEM_OPTS=""
 # Swap usage
-SWAP_USED=$(grep "^SwapTotal:\|^SwapFree:" /proc/meminfo | awk '{sum+=$2} END {print int((sum/2 - $2)/1024)}' 2>/dev/null || echo 0)
+SWAP_USED=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{print int((t-f)/1024)}' /proc/meminfo 2>/dev/null || echo 0)
 [[ "${SWAP_USED}" -gt 100 ]] && MEM_OPTS="${MEM_OPTS} swap_in_use"
 
 # Large slab cache
@@ -1502,7 +1478,8 @@ fi
 
 # Check sysstat/sar
 if systemctl is-active sysstat &>/dev/null; then
-    SAR_INTERVAL=$(grep -oP '(?<=\*/)\d+' /etc/cron.d/sysstat 2>/dev/null || echo "10")
+    SAR_INTERVAL=$(sed -n 's|.*/\([0-9]*\).*|\1|p' /etc/cron.d/sysstat 2>/dev/null | head -1)
+    SAR_INTERVAL=${SAR_INTERVAL:-10}
     printf "│ %-20.20s %-29.29s %-24.24s │\n" "sysstat/sar:" "running (${SAR_INTERVAL}min)" "(~0.5-1% I/O)"
 fi
 
@@ -1740,7 +1717,7 @@ fi
 if [[ ${OPT_LOW_LATENCY} -eq 1 ]]; then
     # Limit C-states to C1
     for cpu in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
-        STATE=$(echo "${cpu}" | grep -oP 'state\K[0-9]+')
+        STATE=$(echo "${cpu}" | sed -n 's/.*state\([0-9]*\).*/\1/p')
         [[ "${STATE}" -gt 1 ]] && write_value_quiet "${cpu}" 1
     done
     # Disable watchdogs
@@ -1788,15 +1765,6 @@ else
     TUNE_VFS_PRESSURE=100
     TUNE_DIRTY_EXPIRE=1000   # 10s - low RAM, flush quickly
     TUNE_DIRTY_WRITEBACK=200 # 2s
-fi
-
-# Dirty bytes based on storage type (absolute limits)
-if [[ ${HW_PRIMARY_SSD} -eq 1 ]]; then
-    TUNE_DIRTY_BYTES=$((256 * 1024 * 1024))   # 256MB - SSD handles small writes well
-    TUNE_DIRTY_BG_BYTES=$((64 * 1024 * 1024)) # 64MB background threshold
-else
-    TUNE_DIRTY_BYTES=$((512 * 1024 * 1024))    # 512MB - HDD benefits from batching
-    TUNE_DIRTY_BG_BYTES=$((128 * 1024 * 1024)) # 128MB
 fi
 
 # Min free memory: 1% of RAM, capped between 64MB-256MB
@@ -1988,6 +1956,10 @@ case ${OPT_PROFILE} in
     laptop)
         TMP_PERCENT=10 # Smaller to save RAM
         SHM_PERCENT=25
+        ;;
+    latency)
+        TMP_PERCENT=25
+        SHM_PERCENT=50
         ;;
 esac
 
@@ -2293,7 +2265,7 @@ if [[ "${KERNEL_MAJOR}" -ge 6 ]]; then
 fi
 
 # --- Kernel 6.12+ Specific ---
-if [[ "${KERNEL_MAJOR}" -ge 6 ]] && [[ "${KERNEL_MINOR}" -ge 12 ]]; then
+if [[ "${KERNEL_MAJOR}" -gt 6 ]] || { [[ "${KERNEL_MAJOR}" -eq 6 ]] && [[ "${KERNEL_MINOR}" -ge 12 ]]; }; then
     echo ""
     echo "[KERNEL 6.12+] Applying latest kernel optimizations..."
 
@@ -2531,9 +2503,7 @@ for DEV in "${!DISK_TYPE[@]}"; do
     [[ -f "${Q}/rq_affinity" ]] && write_value_quiet "${Q}/rq_affinity" 2
 done
 echo "  ✓ Queue tuning: applied (${OPT_PROFILE})"
-
-# --- Readahead (RAM-based, in KB) ---
-# Larger readahead benefits sequential reads but wastes RAM for random I/O
+# Readahead summary value (actual per-device readahead is set in the loop above)
 if [[ "${HW_MEM_TOTAL_GB}" -ge 32 ]]; then
     TUNE_READAHEAD=$((CONST_READAHEAD_BASE_HIGH * 4))
 elif [[ "${HW_MEM_TOTAL_GB}" -ge 16 ]]; then
@@ -2541,19 +2511,6 @@ elif [[ "${HW_MEM_TOTAL_GB}" -ge 16 ]]; then
 else
     TUNE_READAHEAD=$((CONST_READAHEAD_BASE_LOW * 2))
 fi
-for ra in /sys/block/*/queue/read_ahead_kb; do
-    DEV=$(echo "${ra}" | cut -d/ -f4)
-    [[ "${DEV}" =~ ^(loop|ram|dm-) ]] && continue
-    # Skip cloud storage - already tuned above
-    [[ -n "${DISK_CLOUD[${DEV}]:-}" ]] && [[ "${DISK_CLOUD[${DEV}]}" != "local" ]] && continue
-    ROT="/sys/block/${DEV}/queue/rotational"
-    if [[ -f "${ROT}" ]] && [[ "$(cat "${ROT}")" -eq 0 ]]; then
-        write_value_quiet "${ra}" $((TUNE_READAHEAD / 4))
-    else
-        write_value_quiet "${ra}" "${TUNE_READAHEAD}"
-    fi
-done
-echo "  ✓ Readahead: configured"
 
 #-------------------------------------------------------------------------------
 # 3.4 FILESYSTEM OPTIMIZATIONS
@@ -2561,8 +2518,8 @@ echo "  ✓ Readahead: configured"
 echo ""
 echo "[FILESYSTEM] Analyzing and optimizing filesystems..."
 
-declare -A FS_RECOMMENDATIONS
-declare -A FS_TYPES
+declare -A FS_RECOMMENDATIONS=()
+declare -A FS_TYPES=()
 
 # Detect all filesystems
 while read -r DEV MOUNT FSTYPE OPTS REST; do
@@ -2641,7 +2598,7 @@ while read -r DEV MOUNT FSTYPE OPTS REST; do
             # Btrfs-specific runtime tuning
             if [[ -d "/sys/fs/btrfs" ]]; then
                 # Find UUID
-                BTRFS_UUID=$(btrfs filesystem show "${MOUNT}" 2>/dev/null | grep -oP 'uuid: \K[a-f0-9-]+' | head -1)
+                BTRFS_UUID=$(btrfs filesystem show "${MOUNT}" 2>/dev/null | sed -n 's/.*uuid: \([a-f0-9-]*\).*/\1/p' | head -1)
                 if [[ -n "${BTRFS_UUID}" ]] && [[ -d "/sys/fs/btrfs/${BTRFS_UUID}" ]]; then
                     # Optimize metadata ratio
                     if [[ ${OPT_APPLY_FS_TUNING} -eq 1 ]]; then
@@ -2711,7 +2668,10 @@ else
 fi
 
 # Save recommendations
-if [[ -v FS_RECOMMENDATIONS[@] ]] && [[ ${#FS_RECOMMENDATIONS[@]} -gt 0 ]]; then
+if [[ "${#FS_RECOMMENDATIONS[@]}" -gt 0 ]]; then
+    if [[ -z "${CFG_FSTAB_HINTS}" ]]; then
+        CFG_FSTAB_HINTS=$(mktemp /tmp/system-optimize-fstab.XXXXXX)
+    fi
     write_file "${CFG_FSTAB_HINTS}" <<'EOF'
 # Filesystem Mount Option Recommendations
 # Generated by system_optimize.sh
@@ -3076,7 +3036,7 @@ if [[ "${CLOUD_PROVIDER}" != "none" ]]; then
             for disk in /sys/block/sd*; do
                 [[ -d "${disk}" ]] || continue
                 write_value_quiet "${disk}/queue/nr_requests" 256
-                write_value_quiet "${disk}/queue/read_ahead_kb" 4096
+                write_value_quiet "${disk}/queue/read_ahead_kb" 128
             done
             echo "  ✓ Managed disks: queue optimized"
 
@@ -3087,16 +3047,20 @@ if [[ "${CLOUD_PROVIDER}" != "none" ]]; then
 
         gcp)
             # GCP: Local SSD optimization
+            _gcp_has_local_ssd=0
             for nvme in /sys/block/nvme*; do
                 [[ -d "${nvme}" ]] || continue
+                _gcp_has_local_ssd=1
                 write_value_quiet "${nvme}/queue/scheduler" none
                 write_value_quiet "${nvme}/queue/add_random" 0
             done
             echo "  ✓ Local SSD: scheduler=none"
 
             # GCP recommends higher dirty ratio for local SSD
-            TUNE_DIRTY_RATIO=20
-            echo "  ✓ Dirty ratio: increased for local SSD"
+            if [[ ${_gcp_has_local_ssd} -eq 1 ]]; then
+                TUNE_DIRTY_RATIO=20
+                echo "  ✓ Dirty ratio: increased for local SSD"
+            fi
             ;;
 
         alibaba)
@@ -3413,11 +3377,9 @@ write_file "${CFG_SYSCTL}" <<EOF
 # Swappiness: lower keeps anonymous memory in RAM; higher swaps more aggressively.
 vm.swappiness = ${TUNE_SWAPPINESS}
 
-# Dirty page writeback tuning (percent + bytes limits).
+# Dirty page writeback tuning (ratio-based).
 vm.dirty_ratio = ${TUNE_DIRTY_RATIO}
 vm.dirty_background_ratio = ${TUNE_DIRTY_BG_RATIO}
-vm.dirty_bytes = ${TUNE_DIRTY_BYTES}
-vm.dirty_background_bytes = ${TUNE_DIRTY_BG_BYTES}
 vm.dirty_expire_centisecs = ${TUNE_DIRTY_EXPIRE}
 vm.dirty_writeback_centisecs = ${TUNE_DIRTY_WRITEBACK}
 
@@ -3435,8 +3397,8 @@ vm.oom_kill_allocating_task = 1
 vm.oom_dump_tasks = 0
 vm.panic_on_oom = 0
 
-# Overcommit behavior (1 = always overcommit, ratio is a soft limit).
-vm.overcommit_memory = 1
+# Overcommit behavior (0 = heuristic overcommit, ratio is the soft limit).
+vm.overcommit_memory = 0
 vm.overcommit_ratio = $((50 + HW_MEM_TOTAL_GB))
 
 # NUMA: zone reclaim can help local allocation but can hurt latency.
@@ -3729,8 +3691,8 @@ printf "│   %-73s │\n" "${CFG_MODPROBE}"
 printf "│     %-71.71s │\n" "-> Blacklisted kernel modules"
 printf "│   %-73s │\n" "${CFG_SERVICE}"
 printf "│     %-71.71s │\n" "-> Boot-time optimization service"
-[[ -v FS_RECOMMENDATIONS[@] ]] && [[ ${#FS_RECOMMENDATIONS[@]} -gt 0 ]] && printf "│   %-73s │\n" "${CFG_FSTAB_HINTS}"
-[[ -v FS_RECOMMENDATIONS[@] ]] && [[ ${#FS_RECOMMENDATIONS[@]} -gt 0 ]] && printf "│     %-71.71s │\n" "-> Suggested mount options for filesystems"
+[[ "${#FS_RECOMMENDATIONS[@]}" -gt 0 ]] && printf "│   %-73s │\n" "${CFG_FSTAB_HINTS}"
+[[ "${#FS_RECOMMENDATIONS[@]}" -gt 0 ]] && printf "│     %-71.71s │\n" "-> Suggested mount options for filesystems"
 echo "└─────────────────────────────────────────────────────────────────────────────┘"
 
 # --- Verification Commands ---
