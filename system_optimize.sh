@@ -595,8 +595,6 @@ write_value_quiet() {
     write_value "$1" "$2" 2>/dev/null || true
 }
 
-
-
 # Write/append file content from stdin (respects --dry-run)
 write_file() {
     local path=$1
@@ -754,11 +752,14 @@ fi
 
 # Staging area for sysctl snippets collected during runtime tuning
 SYSCTL_SNIPPETS_FILE=$(mktemp -p /tmp system-optimize-sysctl.XXXXXX)
-trap 'rm -f "${SYSCTL_SNIPPETS_FILE}" "${CFG_FSTAB_HINTS}" 2>/dev/null || true' EXIT
+trap 'rm -f "${SYSCTL_SNIPPETS_FILE:-}" "${CFG_FSTAB_HINTS:-}" 2>/dev/null || true' EXIT
 
 # --- Distribution Detection ---
-# shellcheck source=/dev/null
-. /etc/os-release 2>/dev/null || ID="unknown"
+# Extract only needed variables to avoid overwriting script vars
+if [[ -f /etc/os-release ]]; then
+    eval "$(grep -E '^(ID|VERSION_ID|PRETTY_NAME|NAME)=' /etc/os-release 2>/dev/null)"
+fi
+: "${ID:=unknown}"
 DISTRO=${ID}
 DISTRO_ID="${ID:-unknown}"
 # DISTRO_VERSION_ID="${VERSION_ID:-}" # Unused
@@ -882,9 +883,13 @@ echo ">>> Phase 1: Detecting Hardware Configuration..."
 echo ""
 
 # --- CPU Detection ---
-HW_CPU_VENDOR=$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
-HW_CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)
-HW_CPU_FAMILY=$(grep -m1 'cpu family' /proc/cpuinfo | awk '{print $4}')
+_CPUINFO=$(awk -F': *' '
+    /^vendor_id/{v=$2} /^model name/{m=$2} /^cpu family/{f=$2}
+    v && m && f {printf "%s\n%s\n%s\n",v,m,f; exit}
+' /proc/cpuinfo)
+HW_CPU_VENDOR=$(sed -n '1p' <<< "${_CPUINFO}")
+HW_CPU_MODEL=$(sed -n '2p' <<< "${_CPUINFO}")
+HW_CPU_FAMILY=$(sed -n '3p' <<< "${_CPUINFO}")
 HW_CPU_CORES=$(nproc)
 
 # --- Memory Detection ---
@@ -893,7 +898,8 @@ HW_MEM_TOTAL_GB=$(( (HW_MEM_TOTAL_KB + 1048575) / 1024 / 1024 ))
 [[ ${HW_MEM_TOTAL_GB} -lt 1 ]] && HW_MEM_TOTAL_GB=1
 
 # --- Topology Detection ---
-HW_NUMA_NODES=$((0 + $( (ls -d /sys/devices/system/node/node* 2>/dev/null || true) | wc -l)))
+HW_NUMA_NODES=$(find /sys/devices/system/node -maxdepth 1 -name 'node[0-9]*' -type d 2>/dev/null | wc -l)
+[[ ${HW_NUMA_NODES} -lt 1 ]] && HW_NUMA_NODES=1
 HW_IS_VM=$(systemd-detect-virt 2>/dev/null) || HW_IS_VM="none"
 
 # --- SMT Detection ---
@@ -1306,9 +1312,9 @@ elif iptables -L -n 2>/dev/null | grep -q "Chain"; then
 fi
 printf "│ %-20.20s %-29.29s %-24.24s │\n" "Firewall:" "${FIREWALL_STATUS}" "(${FIREWALL_IMPACT})"
 
-# Check IOMMU/VT-d (for passthrough, slight overhead otherwise)
+# Check IOMMU/VT-d via sysfs (faster, no privilege issues unlike dmesg)
 IOMMU_STATUS="disabled"
-if dmesg 2>/dev/null | grep -qi "IOMMU enabled\|DMAR.*IOMMU"; then
+if [[ -d /sys/kernel/iommu_groups ]] && [[ $(find /sys/kernel/iommu_groups -maxdepth 1 -type d 2>/dev/null | wc -l) -gt 1 ]]; then
     IOMMU_STATUS="enabled"
     IOMMU_IMPACT="~1-2% I/O (if unused)"
 else
@@ -1435,7 +1441,10 @@ echo "├───────────────────────�
 
 # Current memory stats
 MEM_TOTAL=$((HW_MEM_TOTAL_KB / 1024))
-eval "$(awk '/^MemAvailable:/{printf "MEM_AVAIL=%d\n",int($2/1024)} /^Buffers:/{printf "MEM_BUFFERS=%d\n",int($2/1024)} /^Cached:/{printf "MEM_CACHED=%d\n",int($2/1024)} /^Slab:/{printf "MEM_SLAB=%d\n",int($2/1024)}' /proc/meminfo)"
+MEM_AVAIL=$(awk '/^MemAvailable:/{printf "%d", int($2/1024)}' /proc/meminfo)
+MEM_BUFFERS=$(awk '/^Buffers:/{printf "%d", int($2/1024)}' /proc/meminfo)
+MEM_CACHED=$(awk '/^Cached:/{printf "%d", int($2/1024)}' /proc/meminfo)
+MEM_SLAB=$(awk '/^Slab:/{printf "%d", int($2/1024)}' /proc/meminfo)
 MEM_USED=$((MEM_TOTAL - MEM_AVAIL))
 
 printf "│ %-20.20s %-54.54s │\n" "Total:" "${MEM_TOTAL}MB"
@@ -1616,7 +1625,7 @@ if [[ ${OPT_DISABLE_MITIGATIONS} -eq 1 ]]; then
         [[ "${HW_CPU_VENDOR}" = "AuthenticAMD" ]] && [[ "${HW_CPU_FAMILY}" = "23" ]] && MITIG_PARAMS="mitigations=off retbleed=off"
 
         run sed -i 's/mitigations=[^ "]*//g; s/tsx=[^ "]*//g; s/tsx_async_abort=[^ "]*//g; s/mds=[^ "]*//g; s/l1tf=[^ "]*//g; s/retbleed=[^ "]*//g' /etc/default/grub
-        run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} /" /etc/default/grub
+        run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} |" /etc/default/grub
         run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub
 
         # Azure/cloud-init VMs: also update grub.d override file
@@ -1624,7 +1633,7 @@ if [[ ${OPT_DISABLE_MITIGATIONS} -eq 1 ]]; then
             backup_file "/etc/default/grub.d/50-cloudimg-settings.cfg"
             run sed -i 's/mitigations=[^ "]*//g; s/tsx=[^ "]*//g; s/tsx_async_abort=[^ "]*//g; s/mds=[^ "]*//g; s/l1tf=[^ "]*//g; s/retbleed=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
             if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub.d/50-cloudimg-settings.cfg; then
-                run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} /" /etc/default/grub.d/50-cloudimg-settings.cfg
+                run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} |" /etc/default/grub.d/50-cloudimg-settings.cfg
             else
                 run bash -c "echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} ${MITIG_PARAMS}\"' >> /etc/default/grub.d/50-cloudimg-settings.cfg"
             fi
@@ -1639,9 +1648,13 @@ fi
 # --- CPU Isolation (requires reboot) ---
 if [[ -n "${OPT_ISOLATE_CPUS}" ]] && [[ -f /etc/default/grub ]]; then
     backup_file "/etc/default/grub"
+    # Sanitize user input before use in sed patterns
+    if [[ ! "${OPT_ISOLATE_CPUS}" =~ ^[0-9]+([,\-][0-9]+)*$ ]]; then
+        die "Invalid characters in --isolate-cpus: ${OPT_ISOLATE_CPUS}"
+    fi
     ISOL_PARAMS="isolcpus=${OPT_ISOLATE_CPUS} nohz_full=${OPT_ISOLATE_CPUS} rcu_nocbs=${OPT_ISOLATE_CPUS}"
     run sed -i 's/isolcpus=[^ "]*//g; s/nohz_full=[^ "]*//g; s/rcu_nocbs=[^ "]*//g' /etc/default/grub
-    run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} /" /etc/default/grub
+    run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} |" /etc/default/grub
     run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub
 
     # Azure/cloud-init VMs: also update grub.d override file
@@ -1649,7 +1662,7 @@ if [[ -n "${OPT_ISOLATE_CPUS}" ]] && [[ -f /etc/default/grub ]]; then
         backup_file "/etc/default/grub.d/50-cloudimg-settings.cfg"
         run sed -i 's/isolcpus=[^ "]*//g; s/nohz_full=[^ "]*//g; s/rcu_nocbs=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
         if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub.d/50-cloudimg-settings.cfg; then
-            run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} /" /etc/default/grub.d/50-cloudimg-settings.cfg
+            run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} |" /etc/default/grub.d/50-cloudimg-settings.cfg
         else
             run bash -c "echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} ${ISOL_PARAMS}\"' >> /etc/default/grub.d/50-cloudimg-settings.cfg"
         fi
@@ -1688,7 +1701,7 @@ if [[ "${OPT_PROFILE}" = "latency" ]] && [[ -f /etc/default/grub ]]; then
         run sed -i 's/transparent_hugepage=[^ "]*//g; s/skew_tick=[^ "]*//g' /etc/default/grub
 
         # Add new parameters
-        run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}/" /etc/default/grub
+        run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}|" /etc/default/grub
         run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub
 
         # Azure/cloud-init VMs: also update grub.d override file
@@ -1698,7 +1711,7 @@ if [[ "${OPT_PROFILE}" = "latency" ]] && [[ -f /etc/default/grub ]]; then
             run sed -i 's/idle=[^ "]*//g; s/nowatchdog//g; s/nmi_watchdog=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
             run sed -i 's/transparent_hugepage=[^ "]*//g; s/skew_tick=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
             if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub.d/50-cloudimg-settings.cfg; then
-                run sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}/" /etc/default/grub.d/50-cloudimg-settings.cfg
+                run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}|" /etc/default/grub.d/50-cloudimg-settings.cfg
             else
                 run bash -c "echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} ${LATENCY_PARAMS}\"' >> /etc/default/grub.d/50-cloudimg-settings.cfg"
             fi
@@ -1984,13 +1997,13 @@ fi
 echo ""
 echo "[OOM] Configuring OOM killer..."
 
-# Protect critical system processes
-for proc in sshd systemd journald; do
+# Protect critical system processes (systemd/PID 1 is already kernel-protected)
+for proc in sshd journald; do
     for pid in $(pgrep -x "${proc}" 2>/dev/null); do
-        write_value_quiet "/proc/${pid}/oom_score_adj" -1000
+        [[ -f "/proc/${pid}/oom_score_adj" ]] && write_value_quiet "/proc/${pid}/oom_score_adj" -1000
     done
 done
-echo "  ✓ OOM: protected sshd, systemd, journald"
+echo "  ✓ OOM: protected sshd, journald"
 
 # --- Intel EPP/EPB (Energy Performance) ---
 if [[ "${HW_CPU_VENDOR}" = "GenuineIntel" ]]; then
@@ -3120,13 +3133,13 @@ if [[ ${OPT_RELAX_SECURITY} -eq 1 ]]; then
     fi
 
     # Disable IOMMU if not used for passthrough (via GRUB)
-    if [[ -f /etc/default/grub ]] && dmesg 2>/dev/null | grep -qi "IOMMU enabled"; then
+    if [[ -f /etc/default/grub ]] && [[ -d /sys/kernel/iommu_groups ]] && [[ $(find /sys/kernel/iommu_groups -maxdepth 1 -type d 2>/dev/null | wc -l) -gt 1 ]]; then
         # Check if any devices use IOMMU
         IOMMU_DEVICES=$(find /sys/kernel/iommu_groups -maxdepth 1 -type d 2>/dev/null | wc -l)
         if [[ "${IOMMU_DEVICES}" -le 1 ]]; then
             if ! grep -q "iommu=off" /etc/default/grub; then
                 backup_file /etc/default/grub
-                run sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="iommu=off /' /etc/default/grub
+                run sed -i 's|GRUB_CMDLINE_LINUX_DEFAULT="|GRUB_CMDLINE_LINUX_DEFAULT="iommu=off |' /etc/default/grub
                 run sed -i 's/  */ /g' /etc/default/grub
                 update_grub_config || true
                 echo "  ✓ IOMMU: will be disabled after reboot"

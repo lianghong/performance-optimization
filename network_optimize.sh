@@ -130,6 +130,10 @@
 #===============================================================================
 
 set -euo pipefail
+if [[ ${BASH_VERSINFO[0]} -lt 4 ]]; then
+    echo "ERROR: Bash 4.0+ required (found ${BASH_VERSION})" >&2
+    exit 1
+fi
 IFS=$'\n\t'
 umask 022
 
@@ -513,9 +517,10 @@ backup_file() {
 # Restore a file from backup or remove if no backup exists
 restore_or_remove() {
     local path=$1 restore_dir=$2
-    local backup_path="$restore_dir/files$path"
+    local backup_path=""
+    [[ -n "$restore_dir" ]] && backup_path="$restore_dir/files$path"
 
-    if [[ -f "$backup_path" ]]; then
+    if [[ -n "$backup_path" && -f "$backup_path" ]]; then
         log "  Restoring: $path"
         run mkdir -p "$(dirname "$path")"
         run cp -a "$backup_path" "$path"
@@ -563,7 +568,7 @@ do_cleanup() {
 
     # Reload udev rules if any Azure rules were removed
     if [ -x /usr/bin/udevadm ]; then
-        udevadm control --reload-rules 2>/dev/null || true
+        run udevadm control --reload-rules 2>/dev/null || true
     fi
 
     # Disable service
@@ -611,8 +616,11 @@ irqbalance_running() {
 }
 
 # --- Distribution Detection ---
-# shellcheck source=/dev/null
-. /etc/os-release 2>/dev/null || ID="unknown"
+# Extract only needed variables to avoid overwriting script vars
+if [[ -f /etc/os-release ]]; then
+    eval "$(grep -E '^(ID|VERSION_ID|PRETTY_NAME|NAME)=' /etc/os-release 2>/dev/null)"
+fi
+: "${ID:=unknown}"
 DISTRO=$ID
 DISTRO_ID="${ID:-unknown}"
 # DISTRO_VERSION_ID="${VERSION_ID:-}"  # Reserved for future use
@@ -677,7 +685,8 @@ HW_MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 HW_MEM_TOTAL_GB=$(((HW_MEM_TOTAL_KB + 524288) / 1024 / 1024))  # Round to nearest GB
 HW_CPU_CORES=$(nproc)
 HW_IS_VM=$(systemd-detect-virt 2>/dev/null) || HW_IS_VM="none"
-HW_NUMA_NODES=$((0 + $( (ls -d /sys/devices/system/node/node* 2>/dev/null || true) | wc -l)))
+HW_NUMA_NODES=$(find /sys/devices/system/node -maxdepth 1 -name 'node[0-9]*' -type d 2>/dev/null | wc -l)
+[[ ${HW_NUMA_NODES} -lt 1 ]] && HW_NUMA_NODES=1
 
 # --- Cloud Provider & Instance Type Detection ---
 CLOUD_PROVIDER="none"
@@ -693,11 +702,11 @@ if [ "$HW_IS_VM" != "none" ]; then
     if [[ "$DMI_VENDOR" == *"amazon"* ]] || [[ "$DMI_PRODUCT" == *"ec2"* ]]; then
         CLOUD_PROVIDER="aws"
         # AWS: Get instance type from IMDS (try IMDSv2 first, fallback to IMDSv1)
-        TOKEN=$(curl -sf -m1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "")
+        TOKEN=$(timeout 1 curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null) || TOKEN=""
         if [ -n "$TOKEN" ]; then
-            INSTANCE_TYPE=$(curl -sf -m1 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "")
+            INSTANCE_TYPE=$(timeout 1 curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null) || INSTANCE_TYPE=""
         else
-            INSTANCE_TYPE=$(curl -sf -m1 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "")
+            INSTANCE_TYPE=$(timeout 1 curl -sf http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null) || INSTANCE_TYPE=""
         fi
     elif [[ "$DMI_VENDOR" == *"microsoft"* ]] || [[ "$DMI_ASSET" == *"azure"* ]]; then
         CLOUD_PROVIDER="azure"
