@@ -2,8 +2,8 @@
 
 ## Project Structure
 
-- `system_optimize.sh`: system performance tuning (CPU/memory/storage/filesystems) with `--dry-run`/`--report` safety modes.
-- `network_optimize.sh`: network tuning (TCP/IP, NIC offloads, RPS/RFS/XPS) with `--dry-run`/`--report`.
+- `system_optimize.sh`: system performance tuning (CPU/memory/storage/filesystems) with `--dry-run`/`--report`/`--verify` safety modes.
+- `network_optimize.sh`: network tuning (TCP/IP, NIC offloads, RPS/RFS/XPS) with `--dry-run`/`--report`/`--verify`.
 - `README.md`: usage, options, and examples.
 - No dedicated `src/` or `tests/` directories; this repo is script-centric.
   - Separation rule: keep `net.*` sysctl tuning in `network_optimize.sh` and avoid introducing overlapping `net.*` keys in `system_optimize.sh`.
@@ -24,7 +24,8 @@
 
 - Language: Bash. Keep `set -euo pipefail` and quote variables (`"$var"`).
 - Prefer existing safety helpers for side effects:
-  - Use `run`/`run_quiet` for commands and `write_value`/`write_file`/`append_file` for writes (ensures `--dry-run`/`--report` remain non-destructive).
+  - Use `run`/`run_quiet` for commands and `write_value`/`write_file`/`append_file` for writes (ensures `--dry-run`/`--report`/`--verify` remain non-destructive).
+  - Use `verify_sysctl`/`verify_sysfs` for `--verify` drift detection checks.
 - Output formatting: box tables assume fixed widths; avoid Unicode bullets/arrows inside padded `printf` fields (use ASCII like `-` and `->`).
 - File names: generated configs use `99-*.conf` naming in `/etc/*` and `*.service` in `/etc/systemd/system/`.
 
@@ -35,7 +36,7 @@
   - `bash -n …` for both scripts (syntax check)
   - `shellcheck` for both scripts (linting)
   - `bashate -i E006` for both scripts (style check, ignore line length)
-  - Run at least one `--dry-run` and one `--report` path to ensure output and heredocs render correctly
+  - Run at least one `--dry-run`, one `--report`, and one `--verify` path to ensure output and heredocs render correctly
 - Test on multiple platforms when possible:
   - AWS EC2 (various instance types, IMDSv2)
   - GCP Compute Engine (e2-micro and larger)

@@ -380,6 +380,7 @@ OPT_YES=0
 OPT_CLEANUP=0
 OPT_RESTORE_FROM=""
 OPT_VERBOSE=0
+OPT_VERIFY=0
 OPT_PROFILE="auto" # server, vm, workstation, laptop, latency, auto
 
 usage() {
@@ -407,6 +408,7 @@ OPTIONS:
   --reclaim-memory       Run one-time memory reclaim actions (drop caches/compact)
   --apply-fs-tuning      Apply filesystem-changing actions (tune2fs/xfs_io/btrfs sysfs/fstrim)
   --report               Print recommended config files and exit (no changes)
+  --verify               Check if applied settings match live system (drift detection)
   --yes                  Assume "yes" for dangerous prompts (non-interactive)
   --dry-run              Print actions without changing the system
   --verbose              Enable detailed debugging output
@@ -462,6 +464,10 @@ for arg in "$@"; do
         --apply-fs-tuning) OPT_APPLY_FS_TUNING=1 ;;
         --report)
             OPT_REPORT=1
+            OPT_DRY_RUN=1
+            ;;
+        --verify)
+            OPT_VERIFY=1
             OPT_DRY_RUN=1
             ;;
         --yes | -y) OPT_YES=1 ;;
@@ -545,9 +551,9 @@ if [[ ${OPT_DRY_RUN} -eq 0 && ${OPT_REPORT} -eq 0 ]]; then
 fi
 
 # --- Preflight Checks ---
-# Help/report/dry-run should be usable without root.
+# Help/report/dry-run/verify should be usable without root.
 if [[ ${OPT_DRY_RUN} -eq 0 && ${OPT_REPORT} -eq 0 ]]; then
-    [[ ${EUID} -ne 0 ]] && die "Run as root (sudo) to apply changes (or use --dry-run/--report without sudo)"
+    [[ ${EUID} -ne 0 ]] && die "Run as root (sudo) to apply changes (or use --dry-run/--report/--verify without sudo)"
     [[ $(uname -m) != "x86_64" ]] && die "x86_64 architecture only"
     validate_environment
 fi
@@ -632,6 +638,51 @@ append_file() {
         return 0
     fi
     cat >>"${path}"
+}
+
+#-------------------------------------------------------------------------------
+# Verify Functions (--verify)
+#-------------------------------------------------------------------------------
+
+# Verify a sysctl value matches expected
+verify_sysctl() {
+    local key=$1 expected=$2
+    local actual
+    actual=$(sysctl -n "${key}" 2>/dev/null) || actual="[not found]"
+    # Normalize whitespace for multi-value sysctls (e.g., tcp_rmem)
+    expected=$(echo "${expected}" | xargs)
+    actual=$(echo "${actual}" | xargs)
+    if [[ "${actual}" == "${expected}" ]]; then
+        printf '  ✓ %-45s = %s\n' "${key}" "${actual}"
+        return 0
+    else
+        printf '  ✗ %-45s expected: %s\n' "${key}" "${expected}"
+        printf '    %-45s     got: %s\n' "" "${actual}"
+        return 1
+    fi
+}
+
+# Verify a sysfs value matches expected
+verify_sysfs() {
+    local path=$1 expected=$2
+    if [[ ! -f "${path}" ]]; then
+        printf '  - %-45s [not present]\n' "${path##*/sys/}"
+        return 0  # Missing sysfs path is not a failure (hardware may differ)
+    fi
+    local actual
+    actual=$(cat "${path}" 2>/dev/null) || actual="[unreadable]"
+    # Handle sysfs files with bracket notation (e.g., scheduler: "none [mq-deadline] bfq")
+    if [[ "${actual}" == *"[${expected}]"* ]]; then
+        printf '  ✓ %-45s = %s\n' "${path##*/sys/}" "${expected}"
+        return 0
+    elif [[ "${actual}" == "${expected}" ]]; then
+        printf '  ✓ %-45s = %s\n' "${path##*/sys/}" "${actual}"
+        return 0
+    else
+        printf '  ✗ %-45s expected: %s\n' "${path##*/sys/}" "${expected}"
+        printf '    %-45s     got: %s\n' "" "${actual}"
+        return 1
+    fi
 }
 
 #-------------------------------------------------------------------------------
@@ -742,6 +793,139 @@ do_cleanup() {
 
 # Run cleanup if requested
 [[ ${OPT_CLEANUP} -eq 1 ]] && do_cleanup
+
+#-------------------------------------------------------------------------------
+# Verify Mode (--verify): check applied settings against live system
+#-------------------------------------------------------------------------------
+if [[ ${OPT_VERIFY} -eq 1 ]]; then
+    VERIFY_PASS=0
+    VERIFY_FAIL=0
+    VERIFY_SKIP=0
+
+    echo "Verifying applied settings..."
+    echo ""
+
+    # 1. Check sysctl config
+    if [[ -f "${CFG_SYSCTL}" ]]; then
+        echo "[SYSCTL] Checking ${CFG_SYSCTL}..."
+        while IFS= read -r line; do
+            [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// /}" ]] && continue
+            key=$(echo "${line}" | cut -d= -f1 | xargs)
+            value=$(echo "${line}" | cut -d= -f2- | sed 's/[[:space:]]*#.*//' | xargs)
+            [[ -z "${key}" ]] && continue
+            if verify_sysctl "${key}" "${value}"; then
+                VERIFY_PASS=$((VERIFY_PASS + 1))
+            else
+                VERIFY_FAIL=$((VERIFY_FAIL + 1))
+            fi
+        done < "${CFG_SYSCTL}"
+    else
+        echo "[SYSCTL] Config not found: ${CFG_SYSCTL} (run the script first)"
+        VERIFY_SKIP=$((VERIFY_SKIP + 1))
+    fi
+
+    # 2. Check systemd config
+    if [[ -f "${CFG_SYSTEMD_SYSTEM}" ]]; then
+        echo ""
+        echo "[SYSTEMD] Checking ${CFG_SYSTEMD_SYSTEM}..."
+        while IFS= read -r line; do
+            [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+            [[ "${line}" =~ ^[[:space:]]*\[ ]] && continue
+            [[ -z "${line// /}" ]] && continue
+            key=$(echo "${line}" | cut -d= -f1 | xargs)
+            value=$(echo "${line}" | cut -d= -f2- | xargs)
+            [[ -z "${key}" ]] && continue
+            # Read current value from systemd
+            local_val=$(systemctl show --property="${key}" 2>/dev/null | cut -d= -f2-) || local_val="[not found]"
+            if [[ "${local_val}" == "${value}" ]]; then
+                printf '  ✓ %-45s = %s\n' "${key}" "${local_val}"
+                VERIFY_PASS=$((VERIFY_PASS + 1))
+            else
+                printf '  ✗ %-45s expected: %s\n' "${key}" "${value}"
+                printf '    %-45s     got: %s\n' "" "${local_val}"
+                VERIFY_FAIL=$((VERIFY_FAIL + 1))
+            fi
+        done < "${CFG_SYSTEMD_SYSTEM}"
+    else
+        echo ""
+        echo "[SYSTEMD] Config not found: ${CFG_SYSTEMD_SYSTEM} (run the script first)"
+        VERIFY_SKIP=$((VERIFY_SKIP + 1))
+    fi
+
+    # 3. Check sysfs values from systemd service file
+    if [[ -f "${CFG_SERVICE}" ]]; then
+        echo ""
+        echo "[SERVICE] Checking sysfs values from ${CFG_SERVICE}..."
+        # Extract 'echo "VALUE" > /sys/PATH' patterns from ExecStart lines
+        # Only match lines where the target is a real /sys/ path (skip shell variables)
+        while IFS= read -r match; do
+            sysfs_value=$(echo "${match}" | sed -n 's/echo\s*"\([^"]*\)"\s*>\s*.*/\1/p')
+            sysfs_path=$(echo "${match}" | sed -n 's/.*>\s*\(\S*\)/\1/p')
+            [[ -z "${sysfs_path}" || -z "${sysfs_value}" ]] && continue
+            # Skip shell variable references (e.g., ${g}, $f)
+            [[ "${sysfs_path}" == *'$'* ]] && continue
+            if verify_sysfs "${sysfs_path}" "${sysfs_value}"; then
+                VERIFY_PASS=$((VERIFY_PASS + 1))
+            else
+                VERIFY_FAIL=$((VERIFY_FAIL + 1))
+            fi
+        done < <(grep -oP 'echo\s+"([^"]+)"\s+>\s+(\S+)' "${CFG_SERVICE}" 2>/dev/null || true)
+    else
+        echo ""
+        echo "[SERVICE] Config not found: ${CFG_SERVICE} (run the script first)"
+        VERIFY_SKIP=$((VERIFY_SKIP + 1))
+    fi
+
+    # 4. Check limits config
+    if [[ -f "${CFG_LIMITS}" ]]; then
+        echo ""
+        echo "[LIMITS] Checking ${CFG_LIMITS}..."
+        while IFS= read -r line; do
+            [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// /}" ]] && continue
+            # Format: domain type item value
+            read -r _domain _type item lim_value <<< "${line}"
+            [[ -z "${item}" || -z "${lim_value}" ]] && continue
+            printf '  i %-45s = %s (configured)\n' "${item}" "${lim_value}"
+            VERIFY_PASS=$((VERIFY_PASS + 1))
+        done < "${CFG_LIMITS}"
+    else
+        echo ""
+        echo "[LIMITS] Config not found: ${CFG_LIMITS} (run the script first)"
+        VERIFY_SKIP=$((VERIFY_SKIP + 1))
+    fi
+
+    # Summary
+    echo ""
+    echo "========================================"
+    echo " Verification Summary"
+    echo "========================================"
+    echo "  Passed:  ${VERIFY_PASS}"
+    echo "  Failed:  ${VERIFY_FAIL}"
+    echo "  Skipped: ${VERIFY_SKIP}"
+    echo ""
+
+    if [[ ${VERIFY_FAIL} -gt 0 ]]; then
+        echo "RESULT: DRIFT DETECTED (${VERIFY_FAIL} settings differ)"
+        exit 1
+    else
+        echo "RESULT: ALL SETTINGS MATCH"
+        exit 0
+    fi
+fi
+
+#-------------------------------------------------------------------------------
+# Lock file: prevent concurrent execution when applying changes
+#-------------------------------------------------------------------------------
+readonly LOCK_FILE="/var/run/system-optimize.lock"
+if [[ ${OPT_DRY_RUN} -eq 0 ]]; then
+    exec 9>"${LOCK_FILE}"
+    if ! flock -n 9; then
+        die "Another instance is already running (lock: ${LOCK_FILE})"
+    fi
+    # Lock is held until process exits (fd 9 auto-closes)
+fi
 
 # Create backup directory for this run
 if [[ ${OPT_DRY_RUN} -eq 0 ]]; then

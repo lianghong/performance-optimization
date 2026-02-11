@@ -10,6 +10,8 @@ Comprehensive, hardware-aware performance tuning scripts for Linux systems. Auto
 - **Dynamic Tuning**: Values scaled based on detected hardware capabilities
 - **Safe Defaults**: Conservative defaults with optional aggressive tuning
 - **Dry-Run Mode**: Preview changes before applying
+- **Drift Detection**: Verify applied settings match the live system (`--verify`)
+- **Concurrent Execution Safety**: Lock file prevents conflicting simultaneous runs
 
 ## Scripts
 
@@ -95,8 +97,16 @@ sudo ./network_optimize.sh --profile=vm
 ### Preview Changes (Dry-Run)
 ```bash
 # See what would be changed without applying
-sudo ./system_optimize.sh --dry-run
-sudo ./network_optimize.sh --dry-run
+./system_optimize.sh --dry-run
+./network_optimize.sh --dry-run
+```
+
+### Verify Applied Settings (Drift Detection)
+```bash
+# Check if applied settings match the live system (no root required)
+./system_optimize.sh --verify
+./network_optimize.sh --verify
+# Exit code: 0 = all match, 1 = drift detected
 ```
 
 ## Command-Line Options
@@ -115,6 +125,7 @@ sudo ./network_optimize.sh --dry-run
 | `--reclaim-memory` | Run one-time memory reclaim actions (drop caches/compact) |
 | `--apply-fs-tuning` | Apply filesystem-changing actions (tune2fs/xfs_io/btrfs sysfs/fstrim) |
 | `--report` | Print recommended config files and exit (no changes) |
+| `--verify` | Check if applied settings match live system (drift detection) |
 | `--yes` | Assume "yes" for dangerous prompts (non-interactive) |
 | `--dry-run` | Preview changes without applying |
 | `--cleanup` | Remove all changes and restore defaults |
@@ -130,6 +141,7 @@ sudo ./network_optimize.sh --dry-run
 | `--low-latency` | Same as --profile=latency |
 | `--dry-run` | Preview changes without applying |
 | `--report` | Print recommended config files and exit (no changes) |
+| `--verify` | Check if applied settings match live system (drift detection) |
 | `--cleanup` | Remove all changes and restore defaults |
 | `--help` | Show help |
 
@@ -247,6 +259,7 @@ readonly CONST_NOFILE_PER_GB_SERVER=65536            # Adjust limits
 |--------|------------|-------------|
 | `--dry-run` | None | Preview only, no changes made |
 | `--report` | None | Generate config files only |
+| `--verify` | None | Read-only drift detection, no changes made |
 | `--profile=*` | Low | Safe kernel parameter tuning |
 | `--reclaim-memory` | Low | Temporary cache clearing |
 | `--apply-fs-tuning` | Medium | Modifies filesystem metadata |

@@ -28,6 +28,10 @@ bashate -i E006 system_optimize.sh network_optimize.sh
 # Generate config reports (no root required)
 ./system_optimize.sh --report > system_report.txt
 ./network_optimize.sh --report > network_report.txt
+
+# Verify applied settings match live system (no root required)
+./system_optimize.sh --verify
+./network_optimize.sh --verify
 ```
 
 ## Architecture
@@ -54,7 +58,9 @@ AWS EC2 (IMDSv2 with v1 fallback, ENA/EFA), Azure (accelerated networking), GCP 
 - Side effects through helpers only:
   - `run`/`run_quiet` for commands
   - `write_value`/`write_file`/`append_file` for writes
-  - These respect `--dry-run` and `--report` modes
+  - `verify_sysctl`/`verify_sysfs` for drift detection
+  - These respect `--dry-run`, `--report`, and `--verify` modes
+- Concurrent execution prevented by `flock`-based lock file (`/var/run/*.lock`)
 - Tuning constants consolidated at script top for easy customization
 - Generated config files use `99-*.conf` naming pattern
 
@@ -72,4 +78,5 @@ No automated test suite. Minimum validation:
 1. Syntax check (`bash -n`) for both scripts
 2. Shellcheck and bashate for both scripts
 3. At least one `--dry-run` and one `--report` run per change
-4. Multi-platform testing when possible (AWS/GCP/Azure/bare metal)
+4. Run `--verify` to confirm drift detection works (exits 0 if all match, 1 if drift)
+5. Multi-platform testing when possible (AWS/GCP/Azure/bare metal)
