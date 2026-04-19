@@ -19,6 +19,7 @@ Comprehensive, hardware-aware performance tuning scripts for Linux systems. Auto
 |--------|---------|
 | `system_optimize.sh` | CPU, memory, I/O, filesystem, and kernel tuning |
 | `network_optimize.sh` | TCP/IP stack, NIC hardware, and packet steering |
+| `lib/common.sh` | Shared helpers sourced by both scripts (logging, safe writes, verify, backup/restore, os-release) |
 
 ## Quick Start
 
@@ -245,6 +246,45 @@ readonly CONST_NOFILE_PER_GB_SERVER=65536            # Adjust limits
 - RHEL / CentOS / Rocky Linux
 - Amazon Linux 2023
 
+## Testing
+
+```bash
+# Full gate: syntax + shellcheck + bashate + bats
+make check
+
+# Just the bats suite
+make test
+```
+
+Requires `bats` (Bats-core). On Debian/Ubuntu: `sudo apt install bats`.
+
+Tests live under `tests/` and cover the `--isolate-cpus` range validator,
+the atomic GRUB-edit helper (`grub_sed_atomic`), the `/etc/os-release`
+parser, and black-box CLI contracts (help text, flag validation, every
+profile dry-runs, `--verify` exit codes). None require root.
+
+## Shell Completion
+
+Bash completion for flags, profiles, and congestion algorithms is shipped in
+`completions/system-optimize.bash`:
+
+```bash
+# User install
+mkdir -p ~/.local/share/bash-completion/completions
+install -m644 completions/system-optimize.bash \
+    ~/.local/share/bash-completion/completions/system_optimize.sh
+ln -sf system_optimize.sh \
+    ~/.local/share/bash-completion/completions/network_optimize.sh
+
+# System-wide install
+sudo install -m644 completions/system-optimize.bash \
+    /etc/bash_completion.d/system-optimize
+```
+
+Tab-completes `--profile=<TAB>` to the six profile names, `--congestion=<TAB>`
+(network script) to known TCP congestion algorithms, and `--restore-from=<TAB>`
+to directories.
+
 ## Safety Notes
 
 1. **Always test in non-production first**
@@ -262,7 +302,7 @@ readonly CONST_NOFILE_PER_GB_SERVER=65536            # Adjust limits
 | `--verify` | None | Read-only drift detection, no changes made |
 | `--profile=*` | Low | Safe kernel parameter tuning |
 | `--reclaim-memory` | Low | Temporary cache clearing |
-| `--apply-fs-tuning` | Medium | Modifies filesystem metadata |
+| `--apply-fs-tuning` | Medium | Modifies filesystem metadata (**not** reverted by `--cleanup`) |
 | `--disable-services` | Medium | Disables system services |
 | `--relax-security` | Medium | Reduces security monitoring |
 | `--isolate-cpus` | Medium | Requires reboot, affects scheduling |
@@ -288,6 +328,15 @@ The scripts automatically backup original files before modification:
 ```
 
 ### Reverting Changes
+
+> **Note:** `--cleanup` restores config files and the GRUB backup, but **filesystem
+> metadata changes made by `--apply-fs-tuning` (tune2fs reserved blocks, XFS extent
+> size hints, btrfs sysfs tunables) are not reverted.** They persist on-disk and
+> must be rolled back manually if needed:
+> ```bash
+> sudo tune2fs -m 5 /dev/sdXN            # restore ext4 reserved blocks (default 5%)
+> sudo xfs_io -c "extsize 0" /mountpoint # clear XFS extent size hint
+> ```
 
 Use the built-in cleanup command (recommended):
 ```bash

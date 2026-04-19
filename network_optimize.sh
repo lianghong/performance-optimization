@@ -137,20 +137,16 @@ fi
 IFS=$'\n\t'
 umask 022
 
-#-------------------------------------------------------------------------------
-# Logging Functions
-#-------------------------------------------------------------------------------
-log() { printf '%s\n' "$*"; }
-warn() { printf 'WARN: %s\n' "$*" >&2; }
-die() {
-    printf 'ERROR: %s\n' "$*" >&2
-    exit 1
-}
+# Load shared helpers (log, warn, die, verbose, run, run_quiet,
+# write_value*, write_file, append_file, verify_sysctl/sysfs, backup helpers,
+# parse_os_release, validate_input/dir).
+_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib/common.sh
+source "${_SCRIPT_DIR}/lib/common.sh"
 
 #-------------------------------------------------------------------------------
 # Configuration Paths
 #-------------------------------------------------------------------------------
-# readonly SCRIPT_NAME="network-optimize"  # Unused
 readonly CFG_SYSCTL="/etc/sysctl.d/99-network-optimize.conf"
 readonly CFG_SERVICE="/etc/systemd/system/network-optimize.service"
 readonly CFG_AZURE_UDEV_RING="/etc/udev/rules.d/99-azure-ring-buffer.rules"
@@ -419,172 +415,12 @@ if [[ $OPT_CLEANUP -eq 1 || ($OPT_DRY_RUN -eq 0 && $OPT_REPORT -eq 0) ]]; then
     [[ $EUID -ne 0 ]] && die "Run as root (sudo) to apply changes (or use --dry-run/--report/--verify without sudo)"
 fi
 
-# Dry-run wrapper: execute or print command
-run() {
-    if [[ $OPT_DRY_RUN -eq 1 ]]; then
-        [[ $OPT_REPORT -eq 1 ]] && return 0
-        printf '[DRY-RUN]'
-        printf ' %s' "$@"
-        printf '\n'
-    else
-        "$@"
-    fi
-}
-
-# Run command and suppress output (but still show in --dry-run)
-run_quiet() {
-    if [[ $OPT_DRY_RUN -eq 1 ]]; then
-        [[ $OPT_REPORT -eq 1 ]] && return 0
-        printf '[DRY-RUN]'
-        printf ' %s' "$@"
-        printf '\n'
-    else
-        "$@" >/dev/null 2>&1
-    fi
-}
-
-# Write a single value to a procfs/sysfs node (respects --dry-run)
-write_value() {
-    local path=$1 value=$2
-    if [[ $OPT_DRY_RUN -eq 1 ]]; then
-        [[ $OPT_REPORT -eq 1 ]] && return 0
-        printf '[DRY-RUN] write %s <= %s\n' "$path" "$value"
-        return 0
-    fi
-    printf '%s\n' "$value" >"$path"
-}
-
-write_value_quiet() {
-    write_value "$1" "$2" >/dev/null 2>&1 || true
-}
-
-# Write/append file content from stdin (respects --dry-run)
-write_file() {
-    local path=$1
-    if [[ $OPT_DRY_RUN -eq 1 ]]; then
-        if [[ $OPT_REPORT -eq 1 ]]; then
-            log ""
-            log "================================================================================"
-            log "RECOMMENDED FILE: $path"
-            log "================================================================================"
-            cat
-            log ""
-            return 0
-        fi
-        log "[DRY-RUN] write file: $path"
-        cat >/dev/null
-        return 0
-    fi
-    cat >"$path"
-}
-
-append_file() {
-    local path=$1
-    if [[ $OPT_DRY_RUN -eq 1 ]]; then
-        if [[ $OPT_REPORT -eq 1 ]]; then
-            log ""
-            log "================================================================================"
-            log "RECOMMENDED APPEND: $path"
-            log "================================================================================"
-            cat
-            log ""
-            return 0
-        fi
-        log "[DRY-RUN] append file: $path"
-        cat >/dev/null
-        return 0
-    fi
-    cat >>"$path"
-}
-
 #-------------------------------------------------------------------------------
-# Verify Functions (--verify)
+# Side-effect / verify / backup helpers (run, run_quiet, write_value,
+# write_value_quiet, write_file, append_file, verify_sysctl, verify_sysfs,
+# latest_backup_dir, backup_file, restore_or_remove) come from lib/common.sh.
+# BACKUP_ROOT and BACKUP_PREFIX are defined below before use.
 #-------------------------------------------------------------------------------
-
-# Verify a sysctl value matches expected
-verify_sysctl() {
-    local key=$1 expected=$2
-    local actual
-    actual=$(sysctl -n "$key" 2>/dev/null) || actual="[not found]"
-    # Normalize whitespace for multi-value sysctls (e.g., tcp_rmem)
-    expected=$(echo "$expected" | xargs)
-    actual=$(echo "$actual" | xargs)
-    if [[ "$actual" == "$expected" ]]; then
-        printf '  ✓ %-45s = %s\n' "$key" "$actual"
-        return 0
-    else
-        printf '  ✗ %-45s expected: %s\n' "$key" "$expected"
-        printf '    %-45s     got: %s\n' "" "$actual"
-        return 1
-    fi
-}
-
-# Verify a sysfs value matches expected
-verify_sysfs() {
-    local path=$1 expected=$2
-    if [[ ! -f "$path" ]]; then
-        printf '  - %-45s [not present]\n' "${path##*/sys/}"
-        return 0  # Missing sysfs path is not a failure (hardware may differ)
-    fi
-    local actual
-    actual=$(cat "$path" 2>/dev/null) || actual="[unreadable]"
-    # Handle sysfs files with bracket notation (e.g., scheduler: "none [mq-deadline] bfq")
-    if [[ "$actual" == *"[$expected]"* ]]; then
-        printf '  ✓ %-45s = %s\n' "${path##*/sys/}" "$expected"
-        return 0
-    elif [[ "$actual" == "$expected" ]]; then
-        printf '  ✓ %-45s = %s\n' "${path##*/sys/}" "$actual"
-        return 0
-    else
-        printf '  ✗ %-45s expected: %s\n' "${path##*/sys/}" "$expected"
-        printf '    %-45s     got: %s\n' "" "$actual"
-        return 1
-    fi
-}
-
-#-------------------------------------------------------------------------------
-# Backup & Restore Functions
-#-------------------------------------------------------------------------------
-
-# Find latest backup directory
-latest_backup_dir() {
-    local name
-    name=$(find "$BACKUP_ROOT" -maxdepth 1 -type d -name "${BACKUP_PREFIX}-*" -printf '%T@ %f\n' 2>/dev/null | sort -nr | head -n1 | awk '{print $2}')
-    [[ -n "$name" && -d "$BACKUP_ROOT/$name" ]] && echo "$BACKUP_ROOT/$name"
-}
-
-# Backup a file before modifying
-backup_file() {
-    local path=$1
-    [[ -z "$BACKUP_DIR" ]] && return 0
-    [[ -e "$path" ]] || return 0
-    local dest_dir
-    dest_dir="$BACKUP_DIR/files$(dirname "$path")"
-    run mkdir -p "$dest_dir"
-    run cp -a "$path" "$dest_dir/"
-    log "  Backed up: $path"
-}
-
-# Restore a file from backup or remove if no backup exists
-restore_or_remove() {
-    local path=$1 restore_dir=$2
-    local backup_path=""
-    [[ -n "$restore_dir" ]] && backup_path="$restore_dir/files$path"
-
-    if [[ -n "$backup_path" && -f "$backup_path" ]]; then
-        log "  Restoring: $path"
-        run mkdir -p "$(dirname "$path")"
-        run cp -a "$backup_path" "$path"
-        return 0
-    fi
-
-    if [[ -e "$path" ]]; then
-        log "  Removing: $path"
-        run rm -f "$path"
-        return 0
-    fi
-    return 1
-}
 
 # Cleanup function: restore from backup
 do_cleanup() {
@@ -751,14 +587,12 @@ irqbalance_running() {
 }
 
 # --- Distribution Detection ---
-# Extract only needed variables to avoid overwriting script vars
-if [[ -f /etc/os-release ]]; then
-    eval "$(grep -E '^(ID|VERSION_ID|PRETTY_NAME|NAME)=' /etc/os-release 2>/dev/null)"
-fi
+# parse_os_release (from lib/common.sh) populates ID/VERSION_ID/NAME/PRETTY_NAME
+# without eval. Safe to call when /etc/os-release is missing — it's a no-op.
+parse_os_release
 : "${ID:=unknown}"
 DISTRO=$ID
 DISTRO_ID="${ID:-unknown}"
-# DISTRO_VERSION_ID="${VERSION_ID:-}"  # Reserved for future use
 DISTRO_PRETTY="${PRETTY_NAME:-}"
 if [[ -z "$DISTRO_PRETTY" ]]; then
     DISTRO_PRETTY="${NAME:-$DISTRO}${VERSION_ID:+ $VERSION_ID}"
@@ -817,6 +651,11 @@ log ""
 
 # --- System Info ---
 HW_MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+# Guard against malformed /proc/meminfo; 1 GiB minimum avoids divide-by-zero.
+if ! [[ "${HW_MEM_TOTAL_KB}" =~ ^[0-9]+$ ]] || [[ ${HW_MEM_TOTAL_KB} -lt 1 ]]; then
+    warn "Unable to parse MemTotal from /proc/meminfo; assuming 1 GiB"
+    HW_MEM_TOTAL_KB=1048576
+fi
 HW_MEM_TOTAL_GB=$(((HW_MEM_TOTAL_KB + 524288) / 1024 / 1024))  # Round to nearest GB
 HW_CPU_CORES=$(nproc)
 HW_IS_VM=$(systemd-detect-virt 2>/dev/null) || HW_IS_VM="none"
@@ -837,24 +676,25 @@ if [ "$HW_IS_VM" != "none" ]; then
     if [[ "$DMI_VENDOR" == *"amazon"* ]] || [[ "$DMI_PRODUCT" == *"ec2"* ]]; then
         CLOUD_PROVIDER="aws"
         # AWS: Get instance type from IMDS (try IMDSv2 first, fallback to IMDSv1)
-        TOKEN=$(timeout 1 curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null) || TOKEN=""
+        # Timeout 2s balances IMDS init latency vs. startup speed on non-cloud hosts.
+        TOKEN=$(timeout 2 curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null) || TOKEN=""
         if [ -n "$TOKEN" ]; then
-            INSTANCE_TYPE=$(timeout 1 curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null) || INSTANCE_TYPE=""
+            INSTANCE_TYPE=$(timeout 2 curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null) || INSTANCE_TYPE=""
         else
-            INSTANCE_TYPE=$(timeout 1 curl -sf http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null) || INSTANCE_TYPE=""
+            INSTANCE_TYPE=$(timeout 2 curl -sf http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null) || INSTANCE_TYPE=""
         fi
     elif [[ "$DMI_VENDOR" == *"microsoft"* ]] || [[ "$DMI_ASSET" == *"azure"* ]]; then
         CLOUD_PROVIDER="azure"
         # Azure: Get VM size from IMDS
-        INSTANCE_TYPE=$(curl -sf -m1 -H "Metadata:true" "http://169.254.169.254/metadata/instance/compute/vmSize?api-version=2021-02-01&format=text" 2>/dev/null || echo "")
+        INSTANCE_TYPE=$(curl -sf -m2 -H "Metadata:true" "http://169.254.169.254/metadata/instance/compute/vmSize?api-version=2021-02-01&format=text" 2>/dev/null || echo "")
     elif [[ "$DMI_VENDOR" == *"google"* ]] || [[ "$DMI_PRODUCT" == *"google"* ]]; then
         CLOUD_PROVIDER="gcp"
         # GCP: Get machine type from metadata
-        INSTANCE_TYPE=$(curl -sf -m1 -H "Metadata-Flavor: Google" "http://169.254.169.254/computeMetadata/v1/instance/machine-type" 2>/dev/null | awk -F/ '{print $NF}' || echo "")
+        INSTANCE_TYPE=$(curl -sf -m2 -H "Metadata-Flavor: Google" "http://169.254.169.254/computeMetadata/v1/instance/machine-type" 2>/dev/null | awk -F/ '{print $NF}' || echo "")
     elif [[ "$DMI_VENDOR" == *"alibaba"* ]] || [[ "$DMI_PRODUCT" == *"alibaba"* ]] || [[ "$DMI_PRODUCT" == *"ecs"* ]]; then
         CLOUD_PROVIDER="alibaba"
         # Alibaba: Get instance type from metadata
-        INSTANCE_TYPE=$(curl -sf -m1 http://100.100.100.200/latest/meta-data/instance/instance-type 2>/dev/null || echo "")
+        INSTANCE_TYPE=$(curl -sf -m2 http://100.100.100.200/latest/meta-data/instance/instance-type 2>/dev/null || echo "")
     fi
 
     # Determine network performance tier based on instance type
@@ -958,8 +798,6 @@ echo "├───────────────────────�
 echo "│ NETWORK INTERFACES                                                          │"
 echo "├─────────────────────────────────────────────────────────────────────────────┤"
 
-# declare -A NIC_DRIVER  # Reserved for future use
-# declare -A NIC_SPEED   # Reserved for future use
 for iface in /sys/class/net/*; do
     IFACE=$(basename "$iface")
     [[ "$IFACE" == "lo" ]] && continue

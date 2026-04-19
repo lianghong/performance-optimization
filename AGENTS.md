@@ -4,15 +4,17 @@
 
 - `system_optimize.sh`: system performance tuning (CPU/memory/storage/filesystems) with `--dry-run`/`--report`/`--verify` safety modes.
 - `network_optimize.sh`: network tuning (TCP/IP, NIC offloads, RPS/RFS/XPS) with `--dry-run`/`--report`/`--verify`.
+- `lib/common.sh`: shared helpers (logging, `run`/`write_value`/`write_file`, `verify_*`, backup/restore, `parse_os_release`). Sourced by both scripts — keep it free of script-specific logic and side effects at top level.
 - `README.md`: usage, options, and examples.
-- No dedicated `src/` or `tests/` directories; this repo is script-centric.
+- `tests/`: Bats suite (`*.bats`) covering the CLI, `grub_sed_atomic`, `/etc/os-release` parsing, and `--isolate-cpus` validation. Run with `make test` or `bats tests/`.
+- `Makefile`: `make check` runs syntax + shellcheck + bashate + bats.
+- `completions/system-optimize.bash`: bash completion shared by both scripts.
   - Separation rule: keep `net.*` sysctl tuning in `network_optimize.sh` and avoid introducing overlapping `net.*` keys in `system_optimize.sh`.
 
 ## Build, Test, and Development Commands
 
-- Syntax check (fast, required before PRs):
-  - `bash -n system_optimize.sh`
-  - `bash -n network_optimize.sh`
+- Full gate (required before PRs): `make check` (syntax + shellcheck + bashate + bats)
+- Individual gates: `make syntax`, `make shellcheck`, `make bashate`, `make test`
 - Safe preview (no root required):
   - `./system_optimize.sh --dry-run --profile=workstation`
   - `./network_optimize.sh --dry-run --profile=workstation`
@@ -31,12 +33,9 @@
 
 ## Testing Guidelines
 
-- No automated test suite currently.
-- Minimum validation for any change:
-  - `bash -n …` for both scripts (syntax check)
-  - `shellcheck` for both scripts (linting)
-  - `bashate -i E006` for both scripts (style check, ignore line length)
-  - Run at least one `--dry-run`, one `--report`, and one `--verify` path to ensure output and heredocs render correctly
+- Automated: `make check` (syntax, shellcheck, bashate, bats). Bats suites in `tests/` cover CLI contracts, `grub_sed_atomic`, `/etc/os-release` parsing, and `--isolate-cpus` range validation. No root required.
+- For a new pure function, use `tests/helpers/extract_fn.sh` to pluck the function body and eval it into the test shell — do not source the full script (it `die`s early on non-root hosts).
+- Live-host checks: run `--dry-run`, `--report`, and `--verify` before proposing changes to ensure output/heredoc rendering still works.
 - Test on multiple platforms when possible:
   - AWS EC2 (various instance types, IMDSv2)
   - GCP Compute Engine (e2-micro and larger)

@@ -134,16 +134,12 @@ fi
 IFS=$'\n\t'
 umask 022
 
-#-------------------------------------------------------------------------------
-# Logging Functions
-#-------------------------------------------------------------------------------
-log() { printf '%s\n' "$*"; }
-warn() { printf 'WARN: %s\n' "$*" >&2; }
-die() {
-    printf 'ERROR: %s\n' "$*" >&2
-    exit 1
-}
-verbose() { [[ ${OPT_VERBOSE:-0} -eq 1 ]] && printf 'VERBOSE: %s\n' "$*" >&2 || true; }
+# Load shared helpers (log, warn, die, verbose, run, run_quiet,
+# write_value*, write_file, append_file, verify_sysctl/sysfs, backup helpers,
+# parse_os_release, validate_input/dir).
+_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib/common.sh
+source "${_SCRIPT_DIR}/lib/common.sh"
 
 # Timing helpers for verbose mode
 _timer_start() { [[ ${OPT_VERBOSE:-0} -eq 1 ]] && _TIMER_START=$(date +%s%N 2>/dev/null | cut -c1-13 || echo $(($(date +%s) * 1000))) || true; }
@@ -157,21 +153,8 @@ _timer_end() {
 }
 
 #-------------------------------------------------------------------------------
-# Input Validation
+# Input Validation (validate_input, validate_dir come from lib/common.sh)
 #-------------------------------------------------------------------------------
-validate_input() {
-    local input=$1 pattern=$2 desc=$3
-    if [[ ! "${input}" =~ ${pattern} ]]; then
-        die "Invalid ${desc}: '${input}'"
-    fi
-}
-
-validate_dir() {
-    local path=$1 desc=$2
-    if [[ ! -d "${path}" ]]; then
-        die "${desc} does not exist or is not a directory: ${path}"
-    fi
-}
 
 # Validate environment before applying changes
 validate_environment() {
@@ -248,11 +231,6 @@ log_security_change() {
 #-------------------------------------------------------------------------------
 # Configuration Paths
 #-------------------------------------------------------------------------------
-# shellcheck disable=SC2034
-readonly SCRIPT_NAME="system-optimize"
-# shellcheck disable=SC2034
-readonly SCRIPT_VERSION="1.0"
-
 readonly CFG_SYSCTL="/etc/sysctl.d/99-system-optimize.conf"
 readonly CFG_LIMITS="/etc/security/limits.d/99-system-optimize.conf"
 readonly CFG_SYSTEMD_SYSTEM="/etc/systemd/system.conf.d/99-system-optimize.conf"
@@ -558,176 +536,49 @@ if [[ ${OPT_DRY_RUN} -eq 0 && ${OPT_REPORT} -eq 0 ]]; then
     validate_environment
 fi
 
-# Dry-run wrapper: execute or print command
-run() {
-    if [[ ${OPT_DRY_RUN} -eq 1 ]]; then
-        [[ ${OPT_REPORT} -eq 1 ]] && return 0
-        printf '[DRY-RUN]'
-        printf ' %s' "$@"
-        printf '\n'
-    else
-        "$@"
-    fi
-}
+# Side-effect helpers (run, run_quiet, write_value, write_value_quiet,
+# write_file, append_file) come from lib/common.sh.
 
-# Run command and suppress output (but still show in --dry-run)
-run_quiet() {
-    if [[ ${OPT_DRY_RUN} -eq 1 ]]; then
-        [[ ${OPT_REPORT} -eq 1 ]] && return 0
-        printf '[DRY-RUN]'
-        printf ' %s' "$@"
-        printf '\n'
-    else
-        "$@" >/dev/null 2>&1
-    fi
-}
-
-# Write a single value to a procfs/sysfs node (respects --dry-run)
-write_value() {
-    local path=$1 value=$2
-    if [[ ${OPT_DRY_RUN} -eq 1 ]]; then
-        [[ ${OPT_REPORT} -eq 1 ]] && return 0
-        printf '[DRY-RUN] write %s <= %s\n' "${path}" "${value}"
-        return 0
-    fi
-    if ! printf '%s\n' "${value}" >"${path}" 2>/dev/null; then
-        verbose "Failed to write '${value}' to ${path}"
-        return 1
-    fi
-    return 0
-}
-
-write_value_quiet() {
-    write_value "$1" "$2" 2>/dev/null || true
-}
-
-# Write/append file content from stdin (respects --dry-run)
-write_file() {
+# Apply multiple sed expressions to a file as a single atomic rewrite.
+# Why: chained `sed -i` calls leave a window where power loss corrupts a
+# boot-critical file (e.g., /etc/default/grub). A temp-file + mv is rename()
+# on POSIX, which is atomic on the same filesystem.
+# Usage: grub_sed_atomic /etc/default/grub 'expr1' 'expr2' ...
+grub_sed_atomic() {
     local path=$1
+    shift
+    local args=()
+    local expr
+    for expr in "$@"; do
+        args+=(-e "${expr}")
+    done
     if [[ ${OPT_DRY_RUN} -eq 1 ]]; then
-        if [[ ${OPT_REPORT} -eq 1 ]]; then
-            log ""
-            log "================================================================================"
-            log "RECOMMENDED FILE: ${path}"
-            log "================================================================================"
-            cat
-            log ""
-            return 0
-        fi
-        log "[DRY-RUN] write file: ${path}"
-        cat >/dev/null
+        [[ ${OPT_REPORT} -eq 1 ]] && return 0
+        printf '[DRY-RUN] sed (atomic)'
+        for expr in "$@"; do
+            printf ' -e %q' "${expr}"
+        done
+        printf ' %s\n' "${path}"
         return 0
     fi
-    cat >"${path}"
-}
-
-append_file() {
-    local path=$1
-    if [[ ${OPT_DRY_RUN} -eq 1 ]]; then
-        if [[ ${OPT_REPORT} -eq 1 ]]; then
-            log ""
-            log "================================================================================"
-            log "RECOMMENDED APPEND: ${path}"
-            log "================================================================================"
-            cat
-            log ""
-            return 0
-        fi
-        log "[DRY-RUN] append file: ${path}"
-        cat >/dev/null
-        return 0
-    fi
-    cat >>"${path}"
-}
-
-#-------------------------------------------------------------------------------
-# Verify Functions (--verify)
-#-------------------------------------------------------------------------------
-
-# Verify a sysctl value matches expected
-verify_sysctl() {
-    local key=$1 expected=$2
-    local actual
-    actual=$(sysctl -n "${key}" 2>/dev/null) || actual="[not found]"
-    # Normalize whitespace for multi-value sysctls (e.g., tcp_rmem)
-    expected=$(echo "${expected}" | xargs)
-    actual=$(echo "${actual}" | xargs)
-    if [[ "${actual}" == "${expected}" ]]; then
-        printf '  ✓ %-45s = %s\n' "${key}" "${actual}"
-        return 0
+    local tmp
+    tmp=$(mktemp "${path}.XXXXXX") || return 1
+    # Preserve ownership/mode of the original
+    chmod --reference="${path}" "${tmp}" 2>/dev/null || true
+    chown --reference="${path}" "${tmp}" 2>/dev/null || true
+    if sed "${args[@]}" "${path}" >"${tmp}"; then
+        mv -f "${tmp}" "${path}"
     else
-        printf '  ✗ %-45s expected: %s\n' "${key}" "${expected}"
-        printf '    %-45s     got: %s\n' "" "${actual}"
-        return 1
-    fi
-}
-
-# Verify a sysfs value matches expected
-verify_sysfs() {
-    local path=$1 expected=$2
-    if [[ ! -f "${path}" ]]; then
-        printf '  - %-45s [not present]\n' "${path##*/sys/}"
-        return 0  # Missing sysfs path is not a failure (hardware may differ)
-    fi
-    local actual
-    actual=$(cat "${path}" 2>/dev/null) || actual="[unreadable]"
-    # Handle sysfs files with bracket notation (e.g., scheduler: "none [mq-deadline] bfq")
-    if [[ "${actual}" == *"[${expected}]"* ]]; then
-        printf '  ✓ %-45s = %s\n' "${path##*/sys/}" "${expected}"
-        return 0
-    elif [[ "${actual}" == "${expected}" ]]; then
-        printf '  ✓ %-45s = %s\n' "${path##*/sys/}" "${actual}"
-        return 0
-    else
-        printf '  ✗ %-45s expected: %s\n' "${path##*/sys/}" "${expected}"
-        printf '    %-45s     got: %s\n' "" "${actual}"
+        rm -f "${tmp}"
         return 1
     fi
 }
 
 #-------------------------------------------------------------------------------
-# Backup & Restore Functions
+# Verify / Backup / Restore helpers (verify_sysctl, verify_sysfs,
+# latest_backup_dir, backup_file, restore_or_remove) come from lib/common.sh.
+# BACKUP_ROOT and BACKUP_PREFIX are defined further below before use.
 #-------------------------------------------------------------------------------
-
-# Find latest backup directory
-latest_backup_dir() {
-    local name
-    name=$(find "${BACKUP_ROOT}" -maxdepth 1 -type d -name "${BACKUP_PREFIX}-*" -printf '%T@ %f\n' 2>/dev/null | sort -nr | head -n1 | awk '{print $2}')
-    [[ -n "${name}" && -d "${BACKUP_ROOT}/${name}" ]] && echo "${BACKUP_ROOT}/${name}"
-}
-
-# Backup a file before modifying
-backup_file() {
-    local path=$1
-    [[ -z "${BACKUP_DIR}" ]] && return 0
-    [[ -e "${path}" ]] || return 0
-    local dest_dir
-    dest_dir="${BACKUP_DIR}/files$(dirname "${path}")"
-    run mkdir -p "${dest_dir}"
-    run cp -a "${path}" "${dest_dir}/"
-    log "  Backed up: ${path}"
-}
-
-# Restore a file from backup or remove if no backup exists
-restore_or_remove() {
-    local path=$1 restore_dir=$2
-    local backup_path=""
-    [[ -n "${restore_dir}" ]] && backup_path="${restore_dir}/files${path}"
-
-    if [[ -n "${backup_path}" && -f "${backup_path}" ]]; then
-        log "  Restoring: ${path}"
-        run mkdir -p "$(dirname "${path}")"
-        run cp -a "${backup_path}" "${path}"
-        return 0
-    fi
-
-    if [[ -e "${path}" ]]; then
-        log "  Removing: ${path}"
-        run rm -f "${path}"
-        return 0
-    fi
-    return 1
-}
 
 # Cleanup function: restore from backup
 do_cleanup() {
@@ -939,14 +790,12 @@ SYSCTL_SNIPPETS_FILE=$(mktemp -p /tmp system-optimize-sysctl.XXXXXX)
 trap 'rm -f "${SYSCTL_SNIPPETS_FILE:-}" "${CFG_FSTAB_HINTS:-}" 2>/dev/null || true' EXIT
 
 # --- Distribution Detection ---
-# Extract only needed variables to avoid overwriting script vars
-if [[ -f /etc/os-release ]]; then
-    eval "$(grep -E '^(ID|VERSION_ID|PRETTY_NAME|NAME)=' /etc/os-release 2>/dev/null)"
-fi
+# parse_os_release (from lib/common.sh) populates ID/VERSION_ID/NAME/PRETTY_NAME
+# without eval. Safe to call when /etc/os-release is missing — it's a no-op.
+parse_os_release
 : "${ID:=unknown}"
 DISTRO=${ID}
 DISTRO_ID="${ID:-unknown}"
-# DISTRO_VERSION_ID="${VERSION_ID:-}" # Unused
 DISTRO_PRETTY="${PRETTY_NAME:-}"
 if [[ -z "${DISTRO_PRETTY}" ]]; then
     DISTRO_PRETTY="${NAME:-${DISTRO}}${VERSION_ID:+ ${VERSION_ID}}"
@@ -1078,6 +927,11 @@ HW_CPU_CORES=$(nproc)
 
 # --- Memory Detection ---
 HW_MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+# Guard against malformed /proc/meminfo; 1 KiB minimum avoids divide-by-zero.
+if ! [[ "${HW_MEM_TOTAL_KB}" =~ ^[0-9]+$ ]] || [[ ${HW_MEM_TOTAL_KB} -lt 1 ]]; then
+    warn "Unable to parse MemTotal from /proc/meminfo; assuming 1 GiB"
+    HW_MEM_TOTAL_KB=1048576
+fi
 HW_MEM_TOTAL_GB=$(( (HW_MEM_TOTAL_KB + 1048575) / 1024 / 1024 ))
 [[ ${HW_MEM_TOTAL_GB} -lt 1 ]] && HW_MEM_TOTAL_GB=1
 
@@ -1107,10 +961,12 @@ CLOUD_CONFIDENCE="" # high/medium/low
 imds_fetch() {
     local url=$1 header=${2:-}
     local result=""
+    # Timeout 2s balances reliability (IMDS can be slow during VM init) vs.
+    # overall script startup latency when probing multiple non-matching providers.
     if [[ -n "${header}" ]]; then
-        result=$(timeout 1 curl -sf -H "${header}" "${url}" 2>/dev/null) || true
+        result=$(timeout 2 curl -sf -H "${header}" "${url}" 2>/dev/null) || true
     else
-        result=$(timeout 1 curl -sf "${url}" 2>/dev/null) || true
+        result=$(timeout 2 curl -sf "${url}" 2>/dev/null) || true
     fi
     echo "${result}"
 }
@@ -1272,7 +1128,6 @@ case ${OPT_PROFILE} in
         PROFILE_THP="madvise"
         PROFILE_SWAPPINESS_BASE=$CONST_SWAPPINESS_WORKSTATION
         PROFILE_DIRTY_RATIO_BASE=$CONST_DIRTY_RATIO_WORKSTATION
-        # PROFILE_CSTATE_LIMIT=0 # Unused
         PROFILE_BLACKLIST_DESKTOP=0
         ;;
     laptop)
@@ -1281,7 +1136,6 @@ case ${OPT_PROFILE} in
         PROFILE_THP="never"
         PROFILE_SWAPPINESS_BASE=$CONST_SWAPPINESS_LAPTOP
         PROFILE_DIRTY_RATIO_BASE=$CONST_DIRTY_RATIO_LAPTOP
-        # PROFILE_CSTATE_LIMIT=0 # Unused
         PROFILE_BLACKLIST_DESKTOP=0
         ;;
     latency)
@@ -1291,7 +1145,6 @@ case ${OPT_PROFILE} in
         PROFILE_THP="never"
         PROFILE_SWAPPINESS_BASE=$CONST_SWAPPINESS_LATENCY
         PROFILE_DIRTY_RATIO_BASE=$CONST_DIRTY_RATIO_LATENCY
-        # PROFILE_CSTATE_LIMIT=1        # C1 only (set by OPT_LOW_LATENCY) # Unused
         PROFILE_BLACKLIST_DESKTOP=1
         ;;
     *)
@@ -1531,7 +1384,6 @@ printf "│ %-20.20s %-29.29s %-24.24s │\n" "Kernel lockdown:" "${LOCKDOWN_STA
 
 # Check journald settings
 JOURNAL_STORAGE=$(grep -E "^Storage=" /etc/systemd/journald.conf 2>/dev/null | cut -d= -f2 || echo "auto")
-# JOURNAL_RATE=$(grep -E "^RateLimitBurst=" /etc/systemd/journald.conf 2>/dev/null | cut -d= -f2 || echo "default") # Unused
 [[ -z "${JOURNAL_STORAGE}" ]] && JOURNAL_STORAGE="auto"
 [[ "${JOURNAL_STORAGE}" = "persistent" ]] && JOURNAL_IMPACT="~1-3% I/O" || JOURNAL_IMPACT="minimal"
 printf "│ %-20.20s %-29.29s %-24.24s │\n" "Journald:" "storage=${JOURNAL_STORAGE}" "(${JOURNAL_IMPACT})"
@@ -1597,7 +1449,6 @@ TOTAL_WASTE_MB=0
 RUNNING_SERVICES=""
 for svc_info in "${SERVICES_CHECK_ALL[@]}"; do
     SVC=$(echo "${svc_info}" | cut -d: -f1)
-    # DESC=$(echo "$svc_info" | cut -d: -f2) # Unused
     MEM=$(echo "${svc_info}" | cut -d: -f3)
     PROFILES=$(echo "${svc_info}" | cut -d: -f4)
     MEM_NUM=$(echo "${MEM}" | grep -oE '[0-9]+')
@@ -1808,20 +1659,43 @@ if [[ ${OPT_DISABLE_MITIGATIONS} -eq 1 ]]; then
         [[ "${HW_CPU_VENDOR}" = "GenuineIntel" ]] && MITIG_PARAMS="mitigations=off tsx=on tsx_async_abort=off mds=off l1tf=off"
         [[ "${HW_CPU_VENDOR}" = "AuthenticAMD" ]] && [[ "${HW_CPU_FAMILY}" = "23" ]] && MITIG_PARAMS="mitigations=off retbleed=off"
 
-        run sed -i 's/mitigations=[^ "]*//g; s/tsx=[^ "]*//g; s/tsx_async_abort=[^ "]*//g; s/mds=[^ "]*//g; s/l1tf=[^ "]*//g; s/retbleed=[^ "]*//g' /etc/default/grub
-        run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} |" /etc/default/grub
-        run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub
+        grub_sed_atomic /etc/default/grub \
+            's/mitigations=[^ "]*//g' \
+            's/tsx=[^ "]*//g' \
+            's/tsx_async_abort=[^ "]*//g' \
+            's/mds=[^ "]*//g' \
+            's/l1tf=[^ "]*//g' \
+            's/retbleed=[^ "]*//g' \
+            "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} |" \
+            's/  */ /g' \
+            's/" /"/g'
 
         # Azure/cloud-init VMs: also update grub.d override file
         if [[ -f /etc/default/grub.d/50-cloudimg-settings.cfg ]]; then
             backup_file "/etc/default/grub.d/50-cloudimg-settings.cfg"
-            run sed -i 's/mitigations=[^ "]*//g; s/tsx=[^ "]*//g; s/tsx_async_abort=[^ "]*//g; s/mds=[^ "]*//g; s/l1tf=[^ "]*//g; s/retbleed=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
             if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub.d/50-cloudimg-settings.cfg; then
-                run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} |" /etc/default/grub.d/50-cloudimg-settings.cfg
+                grub_sed_atomic /etc/default/grub.d/50-cloudimg-settings.cfg \
+                    's/mitigations=[^ "]*//g' \
+                    's/tsx=[^ "]*//g' \
+                    's/tsx_async_abort=[^ "]*//g' \
+                    's/mds=[^ "]*//g' \
+                    's/l1tf=[^ "]*//g' \
+                    's/retbleed=[^ "]*//g' \
+                    "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${MITIG_PARAMS} |" \
+                    's/  */ /g' \
+                    's/" /"/g'
             else
                 run bash -c "echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} ${MITIG_PARAMS}\"' >> /etc/default/grub.d/50-cloudimg-settings.cfg"
+                grub_sed_atomic /etc/default/grub.d/50-cloudimg-settings.cfg \
+                    's/mitigations=[^ "]*//g' \
+                    's/tsx=[^ "]*//g' \
+                    's/tsx_async_abort=[^ "]*//g' \
+                    's/mds=[^ "]*//g' \
+                    's/l1tf=[^ "]*//g' \
+                    's/retbleed=[^ "]*//g' \
+                    's/  */ /g' \
+                    's/" /"/g'
             fi
-            run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub.d/50-cloudimg-settings.cfg
         fi
 
         update_grub_config || true
@@ -1836,21 +1710,50 @@ if [[ -n "${OPT_ISOLATE_CPUS}" ]] && [[ -f /etc/default/grub ]]; then
     if [[ ! "${OPT_ISOLATE_CPUS}" =~ ^[0-9]+([,\-][0-9]+)*$ ]]; then
         die "Invalid characters in --isolate-cpus: ${OPT_ISOLATE_CPUS}"
     fi
+    # Validate CPU indices against detected core count (prevents bogus GRUB params
+    # that produce an unbootable or mis-tuned kernel).
+    _max_cpu=$((HW_CPU_CORES - 1))
+    IFS=',' read -ra _isol_parts <<<"${OPT_ISOLATE_CPUS}"
+    for _part in "${_isol_parts[@]}"; do
+        if [[ "${_part}" == *-* ]]; then
+            _lo=${_part%-*}
+            _hi=${_part#*-}
+            [[ ${_lo} -gt ${_hi} ]] && die "Invalid --isolate-cpus range: ${_part}"
+            [[ ${_hi} -gt ${_max_cpu} ]] && die "--isolate-cpus value ${_hi} exceeds available CPUs (0-${_max_cpu})"
+        else
+            [[ ${_part} -gt ${_max_cpu} ]] && die "--isolate-cpus value ${_part} exceeds available CPUs (0-${_max_cpu})"
+        fi
+    done
+    unset _max_cpu _isol_parts _part _lo _hi
     ISOL_PARAMS="isolcpus=${OPT_ISOLATE_CPUS} nohz_full=${OPT_ISOLATE_CPUS} rcu_nocbs=${OPT_ISOLATE_CPUS}"
-    run sed -i 's/isolcpus=[^ "]*//g; s/nohz_full=[^ "]*//g; s/rcu_nocbs=[^ "]*//g' /etc/default/grub
-    run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} |" /etc/default/grub
-    run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub
+    grub_sed_atomic /etc/default/grub \
+        's/isolcpus=[^ "]*//g' \
+        's/nohz_full=[^ "]*//g' \
+        's/rcu_nocbs=[^ "]*//g' \
+        "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} |" \
+        's/  */ /g' \
+        's/" /"/g'
 
     # Azure/cloud-init VMs: also update grub.d override file
     if [[ -f /etc/default/grub.d/50-cloudimg-settings.cfg ]]; then
         backup_file "/etc/default/grub.d/50-cloudimg-settings.cfg"
-        run sed -i 's/isolcpus=[^ "]*//g; s/nohz_full=[^ "]*//g; s/rcu_nocbs=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
         if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub.d/50-cloudimg-settings.cfg; then
-            run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} |" /etc/default/grub.d/50-cloudimg-settings.cfg
+            grub_sed_atomic /etc/default/grub.d/50-cloudimg-settings.cfg \
+                's/isolcpus=[^ "]*//g' \
+                's/nohz_full=[^ "]*//g' \
+                's/rcu_nocbs=[^ "]*//g' \
+                "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${ISOL_PARAMS} |" \
+                's/  */ /g' \
+                's/" /"/g'
         else
             run bash -c "echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} ${ISOL_PARAMS}\"' >> /etc/default/grub.d/50-cloudimg-settings.cfg"
+            grub_sed_atomic /etc/default/grub.d/50-cloudimg-settings.cfg \
+                's/isolcpus=[^ "]*//g' \
+                's/nohz_full=[^ "]*//g' \
+                's/rcu_nocbs=[^ "]*//g' \
+                's/  */ /g' \
+                's/" /"/g'
         fi
-        run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub.d/50-cloudimg-settings.cfg
     fi
 
     update_grub_config || true
@@ -1879,27 +1782,46 @@ if [[ "${OPT_PROFILE}" = "latency" ]] && [[ -f /etc/default/grub ]]; then
     if ! grep -q "processor.max_cstate=1" /etc/default/grub; then
         backup_file "/etc/default/grub"
 
-        # Remove conflicting parameters first
-        run sed -i 's/processor.max_cstate=[^ "]*//g; s/intel_idle.max_cstate=[^ "]*//g' /etc/default/grub
-        run sed -i 's/idle=[^ "]*//g; s/nowatchdog//g; s/nmi_watchdog=[^ "]*//g' /etc/default/grub
-        run sed -i 's/transparent_hugepage=[^ "]*//g; s/skew_tick=[^ "]*//g' /etc/default/grub
-
-        # Add new parameters
-        run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}|" /etc/default/grub
-        run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub
+        grub_sed_atomic /etc/default/grub \
+            's/processor.max_cstate=[^ "]*//g' \
+            's/intel_idle.max_cstate=[^ "]*//g' \
+            's/idle=[^ "]*//g' \
+            's/nowatchdog//g' \
+            's/nmi_watchdog=[^ "]*//g' \
+            's/transparent_hugepage=[^ "]*//g' \
+            's/skew_tick=[^ "]*//g' \
+            "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}|" \
+            's/  */ /g' \
+            's/" /"/g'
 
         # Azure/cloud-init VMs: also update grub.d override file
         if [[ -f /etc/default/grub.d/50-cloudimg-settings.cfg ]]; then
             backup_file "/etc/default/grub.d/50-cloudimg-settings.cfg"
-            run sed -i 's/processor.max_cstate=[^ "]*//g; s/intel_idle.max_cstate=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
-            run sed -i 's/idle=[^ "]*//g; s/nowatchdog//g; s/nmi_watchdog=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
-            run sed -i 's/transparent_hugepage=[^ "]*//g; s/skew_tick=[^ "]*//g' /etc/default/grub.d/50-cloudimg-settings.cfg
             if grep -q 'GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub.d/50-cloudimg-settings.cfg; then
-                run sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}|" /etc/default/grub.d/50-cloudimg-settings.cfg
+                grub_sed_atomic /etc/default/grub.d/50-cloudimg-settings.cfg \
+                    's/processor.max_cstate=[^ "]*//g' \
+                    's/intel_idle.max_cstate=[^ "]*//g' \
+                    's/idle=[^ "]*//g' \
+                    's/nowatchdog//g' \
+                    's/nmi_watchdog=[^ "]*//g' \
+                    's/transparent_hugepage=[^ "]*//g' \
+                    's/skew_tick=[^ "]*//g' \
+                    "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"${LATENCY_PARAMS}|" \
+                    's/  */ /g' \
+                    's/" /"/g'
             else
                 run bash -c "echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} ${LATENCY_PARAMS}\"' >> /etc/default/grub.d/50-cloudimg-settings.cfg"
+                grub_sed_atomic /etc/default/grub.d/50-cloudimg-settings.cfg \
+                    's/processor.max_cstate=[^ "]*//g' \
+                    's/intel_idle.max_cstate=[^ "]*//g' \
+                    's/idle=[^ "]*//g' \
+                    's/nowatchdog//g' \
+                    's/nmi_watchdog=[^ "]*//g' \
+                    's/transparent_hugepage=[^ "]*//g' \
+                    's/skew_tick=[^ "]*//g' \
+                    's/  */ /g' \
+                    's/" /"/g'
             fi
-            run sed -i 's/  */ /g; s/" /"/g' /etc/default/grub.d/50-cloudimg-settings.cfg
         fi
 
         update_grub_config || true
@@ -2326,7 +2248,6 @@ if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
     echo "[CGROUPS] Configuring cgroups v2..."
 
     # Enable all controllers at root
-    # CONTROLLERS=$(cat /sys/fs/cgroup/cgroup.controllers) # Unused
     write_value_quiet /sys/fs/cgroup/cgroup.subtree_control "+cpu +memory +io +pids"
 
     # Set memory.high for user slices (soft limit at 90%)
@@ -2838,15 +2759,10 @@ done </proc/mounts
 echo ""
 echo "[FILESYSTEM] Applying filesystem sysctl tuning..."
 
-# Check which filesystems are in use
-# Check which filesystems are in use
-# HAS_EXT4 and HAS_BTRFS are unused
+# Check which filesystems are in use (only XFS-specific tuning is applied below)
 HAS_XFS=0
 for fs in "${FS_TYPES[@]}"; do
-    # Check which filesystems are in use
-    # [ "$fs" = "ext4" ] && HAS_EXT4=1   # Unused
     [[ "${fs}" = "xfs" ]] && HAS_XFS=1
-    # [ "$fs" = "btrfs" ] && HAS_BTRFS=1 # Unused
 done
 
 # XFS-specific
@@ -3323,8 +3239,9 @@ if [[ ${OPT_RELAX_SECURITY} -eq 1 ]]; then
         if [[ "${IOMMU_DEVICES}" -le 1 ]]; then
             if ! grep -q "iommu=off" /etc/default/grub; then
                 backup_file /etc/default/grub
-                run sed -i 's|GRUB_CMDLINE_LINUX_DEFAULT="|GRUB_CMDLINE_LINUX_DEFAULT="iommu=off |' /etc/default/grub
-                run sed -i 's/  */ /g' /etc/default/grub
+                grub_sed_atomic /etc/default/grub \
+                    's|GRUB_CMDLINE_LINUX_DEFAULT="|GRUB_CMDLINE_LINUX_DEFAULT="iommu=off |' \
+                    's/  */ /g'
                 update_grub_config || true
                 echo "  ✓ IOMMU: will be disabled after reboot"
             fi
