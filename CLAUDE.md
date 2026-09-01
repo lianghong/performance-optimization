@@ -68,6 +68,29 @@ AWS EC2 (IMDSv2 with v1 fallback, ENA/EFA), Azure (accelerated networking), GCP 
 - Tuning constants consolidated at script top for easy customization
 - Generated config files use `99-*.conf` naming pattern
 
+### Persistence: keep shell out of `ExecStart=`
+
+The systemd units generated in Phase 4 must contain nothing but plain
+`ExecStart=-<absolute path>` lines. Everything else — globs, loops, parameter
+expansion — belongs in the generated boot helper script
+(`CFG_BOOT_SCRIPT`, i.e. `/usr/local/sbin/{system,network}-optimize-boot.sh`),
+which is written with `write_file "$path" 0755`. Reasons:
+
+- systemd erases `${NAME}` when the variable is unset and does not run a shell,
+  so an inline `for`/`${var%suffix}` silently becomes a no-op, not an error.
+- `%` is a specifier prefix and needs `%%` escaping in a unit but not in a script.
+- Every `ExecStart=` needs the `-` prefix. Under `Type=oneshot`, one failing
+  un-prefixed line aborts the unit and **skips all later `ExecStart=` lines**
+  (`systemd.service(5)`), so a missing sysctl key can cost you every
+  subsequent setting.
+
+The boot script must mirror the live apply path (same interface filter, same
+guards, same values) and must stay silent: wrap sysfs writes as
+`{ printf '%s\n' "$v" >"$p"; } 2>/dev/null` — a bare `>"$p" 2>/dev/null`
+still leaks the redirect-open error and spams the journal each boot.
+Bake literal values into the heredoc; `tests/boot_script.bats` fails if a
+`${PROFILE_*}`/`${SERVICE_*}`/`${TUNE_*}` reference survives into the artifact.
+
 ## Common Pitfalls
 
 - Array access without existence check (use `${array[key]:-}`)
@@ -75,6 +98,11 @@ AWS EC2 (IMDSv2 with v1 fallback, ENA/EFA), Azure (accelerated networking), GCP 
 - Integer division truncation (add rounding for GB calculations)
 - Cloud metadata timeouts (use `-m1` timeout with curl)
 - Systemd unit file specifier escaping (use `%%` for literal `%`)
+- Bare `VAR=$(cmd | grep ...)` aborts the script under `pipefail` when `grep`
+  finds nothing or the binary is missing — wrap such probes in a function that
+  returns 0 (see `sar_interval_from_cron`, `xfs_log_line`, `btrfs_uuid_for`)
+- The kernel strips leading zeros from CPU masks it echoes back, so compare
+  `rps_cpus`/`xps_cpus` through `normalize_cpu_mask`, never verbatim
 
 ## Testing Guidance
 
@@ -82,7 +110,10 @@ AWS EC2 (IMDSv2 with v1 fallback, ENA/EFA), Azure (accelerated networking), GCP 
 1. Syntax (`bash -n`) for both scripts
 2. Shellcheck and bashate (`-i E006`)
 3. Bats suite under `tests/`:
-   - `cli.bats` — black-box CLI contracts (help, unknown flags, profile validation, every profile dry-runs, `--report` snippet content, root guard, `--isolate-cpus` range)
+   - `cli.bats` — black-box CLI contracts (help, unknown flags, profile validation, every profile dry-runs, `--report` snippet content, root guard, `--isolate-cpus` range, `ExecStart=` invariants)
+   - `boot_script.bats` — the generated `/usr/local/sbin/*-boot.sh` helpers: extracted from `--report`, parsed with `bash -n`, run unprivileged (must exit 0 and print nothing), checked for baked-in literal values and mask agreement with the live path
+   - `report_probes.bats` — the `sar_interval_from_cron` / `xfs_log_line` / `btrfs_uuid_for` probes, which must survive no-match `grep` and missing binaries under `pipefail`
+   - `cpu_mask.bats` — `cpu_mask_for_cores` and `normalize_cpu_mask` (the kernel strips leading zeros from the mask it echoes back)
    - `grub_sed_atomic.bats` — the atomic GRUB-edit helper (single + multi-expr, permission preservation, rollback on sed failure, dry-run/report modes)
    - `os_release.bats` — `/etc/os-release` parser against Ubuntu/RHEL/Amazon Linux/Arch fixtures plus an injection canary
    - `isolate_cpus.bats` — range validator edge cases

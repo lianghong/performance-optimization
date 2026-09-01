@@ -103,23 +103,29 @@ write_value_quiet() {
 }
 
 # Write file content from stdin (respects --dry-run/--report).
+# Optional second arg is a chmod mode applied after the write — needed for
+# generated helper scripts, which systemd must be able to exec.
 write_file() {
-    local path=$1
+    local path=$1 mode=${2:-}
     if [[ ${OPT_DRY_RUN} -eq 1 ]]; then
         if [[ ${OPT_REPORT} -eq 1 ]]; then
             log ""
             log "================================================================================"
-            log "RECOMMENDED FILE: ${path}"
+            log "RECOMMENDED FILE: ${path}${mode:+ (mode ${mode})}"
             log "================================================================================"
             cat
             log ""
             return 0
         fi
-        log "[DRY-RUN] write file: ${path}"
+        log "[DRY-RUN] write file: ${path}${mode:+ (mode ${mode})}"
         cat >/dev/null
         return 0
     fi
     cat >"${path}"
+    if [[ -n "${mode}" ]]; then
+        chmod "${mode}" "${path}" || warn "Failed to set mode ${mode} on ${path}"
+    fi
+    return 0
 }
 
 # Append stdin to a file (respects --dry-run/--report).

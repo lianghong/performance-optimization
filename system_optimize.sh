@@ -238,6 +238,7 @@ readonly CFG_SYSTEMD_USER="/etc/systemd/user.conf.d/99-system-optimize.conf"
 readonly CFG_MODPROBE="/etc/modprobe.d/99-system-optimize-blacklist.conf"
 readonly CFG_JOURNALD="/etc/systemd/journald.conf.d/99-system-optimize.conf"
 readonly CFG_SERVICE="/etc/systemd/system/system-optimize.service"
+readonly CFG_BOOT_SCRIPT="/usr/local/sbin/system-optimize-boot.sh"
 CFG_FSTAB_HINTS=""  # Set later via mktemp when needed
 readonly CFG_GRUB_BACKUP="/etc/default/grub.bak.system-optimize"
 
@@ -575,6 +576,44 @@ grub_sed_atomic() {
 }
 
 #-------------------------------------------------------------------------------
+# Read-only probe helpers for the report path.
+#
+# Each of these wraps a pipeline in a function that always exits 0. Under
+# `set -euo pipefail` a bare `V=$(cmd | grep ... )` assignment aborts the whole
+# script when the tool is missing (127) or grep matches nothing (1), which
+# would kill --report mid-table with no message. Callers want "no value", not
+# "abort", so the exit status is swallowed here rather than at every call site.
+#-------------------------------------------------------------------------------
+
+# Extract the sar collection interval (in minutes) from a sysstat crontab.
+# Matches the */N or M-M/N step in the first field only. Anchoring to the start
+# of the line matters: a greedy `.*/` instead latches onto the last slash on
+# the line (inside `/usr/lib/sysstat` or `> /dev/null`) and captures nothing.
+# Prints nothing if the file is unreadable or has no schedule line.
+sar_interval_from_cron() {
+    local file=${1:-/etc/cron.d/sysstat}
+    [[ -r "${file}" ]] || return 0
+    grep -oE '^[^[:space:]]*/[0-9]+' "${file}" 2>/dev/null |
+        grep -oE '[0-9]+$' | head -1 || true
+    return 0
+}
+
+# First line of `xfs_info` output describing the log section, or nothing.
+xfs_log_line() {
+    local mount=$1
+    xfs_info "${mount}" 2>/dev/null | grep "log" | head -1 || true
+    return 0
+}
+
+# Filesystem UUID for a mounted btrfs volume, or nothing.
+btrfs_uuid_for() {
+    local mount=$1
+    btrfs filesystem show "${mount}" 2>/dev/null |
+        sed -n 's/.*uuid: \([a-f0-9-]*\).*/\1/p' | head -1 || true
+    return 0
+}
+
+#-------------------------------------------------------------------------------
 # Verify / Backup / Restore helpers (verify_sysctl, verify_sysfs,
 # latest_backup_dir, backup_file, restore_or_remove) come from lib/common.sh.
 # BACKUP_ROOT and BACKUP_PREFIX are defined further below before use.
@@ -607,6 +646,7 @@ do_cleanup() {
     restore_or_remove "${CFG_LIMITS}" "${restore_dir}" || true
     restore_or_remove "${CFG_MODPROBE}" "${restore_dir}" || true
     restore_or_remove "${CFG_SERVICE}" "${restore_dir}" || true
+    restore_or_remove "${CFG_BOOT_SCRIPT}" "${restore_dir}" || true
     restore_or_remove "${CFG_GRUB_BACKUP}" "${restore_dir}" || true
 
     # Restore GRUB if backup exists
@@ -704,27 +744,38 @@ if [[ ${OPT_VERIFY} -eq 1 ]]; then
         VERIFY_SKIP=$((VERIFY_SKIP + 1))
     fi
 
-    # 3. Check sysfs values from systemd service file
-    if [[ -f "${CFG_SERVICE}" ]]; then
+    # 3. Check sysfs values from the generated boot script.
+    #
+    # The script writes fixed nodes as `write_sysfs /literal/path value`, which
+    # is what we match here. Glob-driven writes go through write_sysfs_glob and
+    # are deliberately not matched — there is no single expected path to check.
+    if [[ -x "${CFG_BOOT_SCRIPT}" ]]; then
         echo ""
-        echo "[SERVICE] Checking sysfs values from ${CFG_SERVICE}..."
-        # Extract 'echo "VALUE" > /sys/PATH' patterns from ExecStart lines
-        # Only match lines where the target is a real /sys/ path (skip shell variables)
-        while IFS= read -r match; do
-            sysfs_value=$(echo "${match}" | sed -n 's/echo\s*"\([^"]*\)"\s*>\s*.*/\1/p')
-            sysfs_path=$(echo "${match}" | sed -n 's/.*>\s*\(\S*\)/\1/p')
+        echo "[BOOT] Checking sysfs values from ${CFG_BOOT_SCRIPT}..."
+        while read -r _fn sysfs_path sysfs_value; do
             [[ -z "${sysfs_path}" || -z "${sysfs_value}" ]] && continue
-            # Skip shell variable references (e.g., ${g}, $f)
-            [[ "${sysfs_path}" == *'$'* ]] && continue
+            sysfs_value=${sysfs_value%\"}
+            sysfs_value=${sysfs_value#\"}
             if verify_sysfs "${sysfs_path}" "${sysfs_value}"; then
                 VERIFY_PASS=$((VERIFY_PASS + 1))
             else
                 VERIFY_FAIL=$((VERIFY_FAIL + 1))
             fi
-        done < <(grep -oP 'echo\s+"([^"]+)"\s+>\s+(\S+)' "${CFG_SERVICE}" 2>/dev/null || true)
+        done < <(grep -oE '^write_sysfs /[^[:space:]]+ [^[:space:]]+' "${CFG_BOOT_SCRIPT}" 2>/dev/null || true)
+    elif [[ -f "${CFG_SERVICE}" ]] && grep -qF "${CFG_BOOT_SCRIPT}" "${CFG_SERVICE}" 2>/dev/null; then
+        echo ""
+        echo "[BOOT] ✗ ${CFG_BOOT_SCRIPT} missing or not executable"
+        echo "         ${CFG_SERVICE} references it; tuning will not survive reboot"
+        VERIFY_FAIL=$((VERIFY_FAIL + 1))
+    elif [[ -f "${CFG_SERVICE}" ]]; then
+        # Unit written by an older version, which inlined the logic in ExecStart.
+        echo ""
+        echo "[BOOT] - ${CFG_SERVICE} predates the boot helper script"
+        echo "         re-run this script to regenerate it"
+        VERIFY_SKIP=$((VERIFY_SKIP + 1))
     else
         echo ""
-        echo "[SERVICE] Config not found: ${CFG_SERVICE} (run the script first)"
+        echo "[BOOT] Config not found: ${CFG_BOOT_SCRIPT} (run the script first)"
         VERIFY_SKIP=$((VERIFY_SKIP + 1))
     fi
 
@@ -1522,7 +1573,7 @@ fi
 
 # Check sysstat/sar
 if systemctl is-active sysstat &>/dev/null; then
-    SAR_INTERVAL=$(sed -n 's|.*/\([0-9]*\).*|\1|p' /etc/cron.d/sysstat 2>/dev/null | head -1)
+    SAR_INTERVAL=$(sar_interval_from_cron /etc/cron.d/sysstat)
     SAR_INTERVAL=${SAR_INTERVAL:-10}
     printf "│ %-20.20s %-29.29s %-24.24s │\n" "sysstat/sar:" "running (${SAR_INTERVAL}min)" "(~0.5-1% I/O)"
 fi
@@ -2694,7 +2745,7 @@ while read -r DEV MOUNT FSTYPE OPTS REST; do
 
             # Get XFS info
             if command -v xfs_info &>/dev/null; then
-                XFS_LOG=$(xfs_info "${MOUNT}" 2>/dev/null | grep "log" | head -1)
+                XFS_LOG=$(xfs_log_line "${MOUNT}")
                 [[ -n "${XFS_LOG}" ]] && echo "    → Log: ${XFS_LOG}"
             fi
 
@@ -2716,7 +2767,7 @@ while read -r DEV MOUNT FSTYPE OPTS REST; do
             # Btrfs-specific runtime tuning
             if [[ -d "/sys/fs/btrfs" ]]; then
                 # Find UUID
-                BTRFS_UUID=$(btrfs filesystem show "${MOUNT}" 2>/dev/null | sed -n 's/.*uuid: \([a-f0-9-]*\).*/\1/p' | head -1)
+                BTRFS_UUID=$(btrfs_uuid_for "${MOUNT}")
                 if [[ -n "${BTRFS_UUID}" ]] && [[ -d "/sys/fs/btrfs/${BTRFS_UUID}" ]]; then
                     # Optimize metadata ratio
                     if [[ ${OPT_APPLY_FS_TUNING} -eq 1 ]]; then
@@ -3616,17 +3667,93 @@ case ${OPT_PROFILE} in
     *) SERVICE_DISK_SCHED="mq-deadline" ;;
 esac
 
-LOW_LATENCY_UNIT_LINES=""
+# The boot-time logic lives in a standalone script rather than inline in
+# ExecStart=. systemd substitutes ${NAME} before exec (undefined -> empty
+# string) and reads a bare % as a specifier, so `${c%/disable}` in an ExecStart
+# expands to nothing and the surrounding loop becomes a no-op — with no error
+# anywhere. A real script file has none of those hazards.
+#
+# Assembled from pieces so the parts that need runtime shell variables can be
+# fully quoted heredocs (no backslash escaping), while the tuning actions are
+# emitted with literal values. Literal values also let --verify read the
+# intended state straight back out of the script.
+BOOT_SCRIPT_FUNCS=$(
+    cat <<'EOF'
+# Write to a sysfs node, discarding both the write error and the shell's
+# redirect-open error. `>"$path" 2>/dev/null` would not suppress the latter:
+# redirections are applied left to right, so the open failure is reported
+# before stderr is redirected, spamming the journal on every boot.
+write_sysfs() {
+    local path=$1 value=$2
+    { printf '%s\n' "$value" >"$path"; } 2>/dev/null || return 0
+}
+
+# Write the same value to every existing node matching the given paths.
+write_sysfs_glob() {
+    local value=$1
+    shift
+    local path
+    for path in "$@"; do
+        [ -f "$path" ] || continue
+        write_sysfs "$path" "$value"
+    done
+}
+EOF
+)
+
+# Only emitted for --low-latency. Quoted heredoc: the loop needs $cstate and
+# ${cstate%/disable} at runtime, which is exactly what an ExecStart cannot hold.
+BOOT_SCRIPT_CSTATES=""
 if [[ ${OPT_LOW_LATENCY} -eq 1 ]]; then
-    LOW_LATENCY_UNIT_LINES=$(
+    BOOT_SCRIPT_CSTATES=$(
         cat <<'EOF'
 
-# Low-latency only: disable deep CPU idle states (C2+).
-# WARNING: This increases power draw and heat.
-ExecStart=/bin/bash -c 'for c in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do [[ -f "${c}" ]] || continue; st=${c%/disable}; st=${st##*/}; num=${st#state}; case "${num}" in (""|*[!0-9]*) continue ;; esac; [[ "${num}" -gt 1 ]] && echo 1 > "${c}" 2>/dev/null || true; done'
+# Disable deep CPU idle states (C2 and deeper), keeping C0/C1.
+# WARNING: this increases power draw and heat.
+for cstate in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
+    [ -f "$cstate" ] || continue
+    state_dir=${cstate%/disable}
+    state_num=${state_dir##*/state}
+    case "$state_num" in
+        "" | *[!0-9]*) continue ;;
+    esac
+    [ "$state_num" -gt 1 ] && write_sysfs "$cstate" 1
+done
 EOF
     )
 fi
+
+backup_file "${CFG_BOOT_SCRIPT}"
+write_file "${CFG_BOOT_SCRIPT}" 0755 <<EOF
+#!/usr/bin/env bash
+# Auto-generated by system_optimize.sh (profile=${OPT_PROFILE}) — do not edit.
+#
+# Re-applies the runtime-only parts of the tuning at boot. Everything that can
+# live in a config file does (see ${CFG_SYSCTL}); this covers the sysfs nodes
+# that reset on reboot. All actions are best effort: a node missing on this
+# kernel or CPU must not fail the unit.
+set -uo pipefail
+
+${BOOT_SCRIPT_FUNCS}
+
+# CPU frequency governor
+write_sysfs_glob ${PROFILE_GOVERNOR} /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Intel Turbo Boost (intel_pstate): 0=enabled, 1=disabled
+write_sysfs /sys/devices/system/cpu/intel_pstate/no_turbo ${SERVICE_INTEL_NO_TURBO}
+
+# AMD Boost (cpufreq/boost): 1=enabled, 0=disabled
+write_sysfs /sys/devices/system/cpu/cpufreq/boost ${SERVICE_AMD_BOOST}
+
+# Transparent Huge Pages
+write_sysfs /sys/kernel/mm/transparent_hugepage/enabled ${TUNE_THP_MODE}
+
+# Block I/O scheduler
+write_sysfs_glob ${SERVICE_DISK_SCHED} /sys/block/sd*/queue/scheduler /sys/block/nvme*/queue/scheduler
+${BOOT_SCRIPT_CSTATES}
+
+exit 0
+EOF
 
 write_file "${CFG_SERVICE}" <<EOF
 # =============================================================================
@@ -3637,6 +3764,8 @@ write_file "${CFG_SERVICE}" <<EOF
 # persisted in:
 # - $CFG_SYSCTL
 # - $CFG_SYSTEMD_SYSTEM and $CFG_SYSTEMD_USER
+# The sysfs nodes that reset on reboot are handled by:
+# - $CFG_BOOT_SCRIPT
 #
 # Disable:
 #   systemctl disable system-optimize.service
@@ -3649,24 +3778,11 @@ After=multi-user.target
 [Service]
 Type=oneshot
 
-# NOTE: All actions are best-effort. Some nodes may not exist on all kernels/CPUs.
-# Failures are ignored so boot can continue normally.
-
-# CPU governor (cpufreq)
-ExecStart=/bin/bash -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f "\$g" ] || continue; echo "${PROFILE_GOVERNOR}" > "\$g" 2>/dev/null || true; done'
-
-# Intel Turbo Boost (intel_pstate): 0=enabled, 1=disabled
-ExecStart=/bin/bash -c '[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ] && echo "${SERVICE_INTEL_NO_TURBO}" > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true'
-
-# AMD Boost (cpufreq/boost): 1=enabled, 0=disabled
-ExecStart=/bin/bash -c '[ -f /sys/devices/system/cpu/cpufreq/boost ] && echo "${SERVICE_AMD_BOOST}" > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true'
-
-# Transparent Huge Pages (best effort)
-ExecStart=/bin/bash -c 'echo "${TUNE_THP_MODE}" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true'
-
-# Block I/O scheduler (best effort)
-ExecStart=/bin/bash -c 'for d in /sys/block/sd*/queue/scheduler /sys/block/nvme*/queue/scheduler; do [ -f "\$d" ] && echo "${SERVICE_DISK_SCHED}" > "\$d" 2>/dev/null || true; done'
-${LOW_LATENCY_UNIT_LINES}
+# Prefixed with '-' so a failure cannot fail the unit. Per systemd.service(5),
+# an un-prefixed command that exits non-zero in a Type=oneshot unit skips the
+# remaining ExecStart lines and marks the unit failed. All the tuning below is
+# best effort — nodes legitimately missing on some kernels and CPUs.
+ExecStart=-$CFG_BOOT_SCRIPT
 RemainAfterExit=yes
 
 [Install]
@@ -3804,6 +3920,7 @@ printf "│     %-71.71s │\n" "-> Systemd service limits"
 printf "│   %-73s │\n" "${CFG_MODPROBE}"
 printf "│     %-71.71s │\n" "-> Blacklisted kernel modules"
 printf "│   %-73s │\n" "${CFG_SERVICE}"
+printf "│   %-73s │\n" "${CFG_BOOT_SCRIPT}"
 printf "│     %-71.71s │\n" "-> Boot-time optimization service"
 [[ "${#FS_RECOMMENDATIONS[@]}" -gt 0 ]] && printf "│   %-73s │\n" "${CFG_FSTAB_HINTS}"
 [[ "${#FS_RECOMMENDATIONS[@]}" -gt 0 ]] && printf "│     %-71.71s │\n" "-> Suggested mount options for filesystems"

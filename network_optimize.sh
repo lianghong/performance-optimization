@@ -149,6 +149,7 @@ source "${_SCRIPT_DIR}/lib/common.sh"
 #-------------------------------------------------------------------------------
 readonly CFG_SYSCTL="/etc/sysctl.d/99-network-optimize.conf"
 readonly CFG_SERVICE="/etc/systemd/system/network-optimize.service"
+readonly CFG_BOOT_SCRIPT="/usr/local/sbin/network-optimize-boot.sh"
 readonly CFG_AZURE_UDEV_RING="/etc/udev/rules.d/99-azure-ring-buffer.rules"
 readonly CFG_AZURE_UDEV_TXQ="/etc/udev/rules.d/99-azure-txqueue-len.rules"
 readonly CFG_AZURE_UDEV_QDISC="/etc/udev/rules.d/99-azure-qdisc.rules"
@@ -422,6 +423,74 @@ fi
 # BACKUP_ROOT and BACKUP_PREFIX are defined below before use.
 #-------------------------------------------------------------------------------
 
+# Interfaces we never steer or offload-tune: loopback, container, and bridge
+# devices. Enabling RPS on them just adds IPI overhead on local traffic.
+# Kept in sync with the generated boot script ($CFG_BOOT_SCRIPT).
+readonly SKIP_IFACE_RE='^(lo|docker.*|br-.*|veth.*|virbr.*)$'
+
+# CPU mask covering $1 cores, as comma-separated 32-bit groups (low group
+# first, matching the sysfs rps_cpus/xps_cpus format).
+# Defined here rather than in Phase 3 so --verify can compute the expected
+# mask too, instead of scraping it back out of the generated unit.
+cpu_mask_for_cores() {
+    local cores=$1
+    [[ $cores -lt 1 ]] && cores=1
+    local groups rem mask
+    groups=$(((cores + 31) / 32))
+    rem=$((cores % 32))
+    mask=""
+    local i
+    for ((i = 0; i < groups; i++)); do
+        if ((i == 0 && rem != 0)); then
+            mask+=$(printf '%08x' $(((1 << rem) - 1)))
+        else
+            mask+="ffffffff"
+        fi
+        ((i < groups - 1)) && mask+=","
+    done
+    printf '%s\n' "$mask"
+}
+
+# Normalize a CPU mask for comparison.
+# The kernel does not echo rps_cpus/xps_cpus back the way it was written: it
+# strips leading zeros from the most significant group only, so a correctly
+# applied 28-core mask reads back as "fffffff", not the "0fffffff" that was
+# written. Comparing raw strings therefore reports drift that is not there.
+normalize_cpu_mask() {
+    local mask=$1
+    local first=${mask%%,*}
+    local rest=""
+    [[ "$mask" == *,* ]] && rest=",${mask#*,}"
+    # Strip leading zeros, keeping at least one digit (extglob is not enabled).
+    while [[ "$first" == 0* && ${#first} -gt 1 ]]; do
+        first=${first#0}
+    done
+    printf '%s%s\n' "$first" "$rest"
+}
+
+# Compare a CPU-mask sysfs node against the expected mask.
+# Not verify_sysfs: that does a literal string compare (see normalize_cpu_mask)
+# and treats an unreadable node as a failure. xps_cpus is not world-readable on
+# some kernels, and an unreadable node tells us nothing — skip it, the same
+# policy verify_sysfs applies to absent paths.
+# Returns 0 on match, 1 on drift, 2 when skipped.
+verify_cpu_mask() {
+    local path=$1 expected=$2
+    local label=${path##*/sys/}
+    local actual
+    if ! actual=$(cat "$path" 2>/dev/null); then
+        printf '  - %-45s [unreadable]\n' "$label"
+        return 2
+    fi
+    if [[ "$(normalize_cpu_mask "$actual")" == "$(normalize_cpu_mask "$expected")" ]]; then
+        printf '  ✓ %-45s = %s\n' "$label" "$actual"
+        return 0
+    fi
+    printf '  ✗ %-45s expected: %s\n' "$label" "$expected"
+    printf '    %-45s     got: %s\n' "" "$actual"
+    return 1
+}
+
 # Cleanup function: restore from backup
 do_cleanup() {
     log "================================================================================"
@@ -447,6 +516,7 @@ do_cleanup() {
     # Restore or remove config files
     restore_or_remove "/etc/sysctl.d/99-network-optimize.conf" "$restore_dir" || true
     restore_or_remove "/etc/systemd/system/network-optimize.service" "$restore_dir" || true
+    restore_or_remove "/usr/local/sbin/network-optimize-boot.sh" "$restore_dir" || true
 
     # Remove Azure-specific udev rules
     restore_or_remove "/etc/udev/rules.d/99-azure-ring-buffer.rules" "$restore_dir" || true
@@ -514,26 +584,79 @@ if [[ ${OPT_VERIFY} -eq 1 ]]; then
         VERIFY_SKIP=$((VERIFY_SKIP + 1))
     fi
 
-    # 2. Check sysfs values from systemd service file (RPS/XPS masks, NIC settings)
+    # 2. Check packet steering (RPS/RFS/XPS) against the expected values.
+    #
+    # These are computed the same way the apply path computes them rather than
+    # scraped out of the generated unit: the steering targets are per-queue
+    # sysfs paths built from a glob, so the old approach — grepping ExecStart
+    # for `echo "V" > /literal/path` — matched nothing and silently reported
+    # zero checks, which is exactly how boot-vs-live drift stayed invisible.
     if [[ -f "$CFG_SERVICE" ]]; then
         echo ""
-        echo "[SERVICE] Checking sysfs values from $CFG_SERVICE..."
-        while IFS= read -r match; do
-            sysfs_value=$(echo "$match" | sed -n 's/echo\s*"\([^"]*\)"\s*>\s*.*/\1/p')
-            sysfs_path=$(echo "$match" | sed -n 's/.*>\s*\(\S*\)/\1/p')
-            [[ -z "$sysfs_path" || -z "$sysfs_value" ]] && continue
-            # Skip shell variable references (e.g., ${f}, $q)
-            [[ "$sysfs_path" == *'$'* ]] && continue
-            if verify_sysfs "$sysfs_path" "$sysfs_value"; then
-                VERIFY_PASS=$((VERIFY_PASS + 1))
-            else
-                VERIFY_FAIL=$((VERIFY_FAIL + 1))
+        # Hardware detection (HW_CPU_CORES) runs in Phase 2, after this block.
+        VERIFY_CORES=$(nproc 2>/dev/null || echo 1)
+        echo "[STEERING] Checking RPS/RFS/XPS against $VERIFY_CORES cores..."
+        if [[ $VERIFY_CORES -gt 1 ]]; then
+            EXPECT_MASK=$(cpu_mask_for_cores "$VERIFY_CORES")
+            EXPECT_RFS=$((32768 / VERIFY_CORES))
+            STEER_CHECKED=0
+            for IFACE_PATH in /sys/class/net/*; do
+                IFACE=${IFACE_PATH##*/}
+                [[ "$IFACE" =~ $SKIP_IFACE_RE ]] && continue
+                [[ -d "$IFACE_PATH/device" ]] || continue
+                for QNODE in "$IFACE_PATH/queues/rx-"*/rps_cpus "$IFACE_PATH/queues/tx-"*/xps_cpus; do
+                    [[ -f "$QNODE" ]] || continue
+                    STEER_CHECKED=1
+                    MASK_RC=0
+                    verify_cpu_mask "$QNODE" "$EXPECT_MASK" || MASK_RC=$?
+                    case ${MASK_RC} in
+                        0) VERIFY_PASS=$((VERIFY_PASS + 1)) ;;
+                        1) VERIFY_FAIL=$((VERIFY_FAIL + 1)) ;;
+                        *) VERIFY_SKIP=$((VERIFY_SKIP + 1)) ;;
+                    esac
+                done
+                for QNODE in "$IFACE_PATH/queues/rx-"*/rps_flow_cnt; do
+                    [[ -f "$QNODE" ]] || continue
+                    STEER_CHECKED=1
+                    if verify_sysfs "$QNODE" "$EXPECT_RFS"; then
+                        VERIFY_PASS=$((VERIFY_PASS + 1))
+                    else
+                        VERIFY_FAIL=$((VERIFY_FAIL + 1))
+                    fi
+                done
+            done
+            if [[ $STEER_CHECKED -eq 0 ]]; then
+                echo "  - no physical interface with steerable queues found"
+                VERIFY_SKIP=$((VERIFY_SKIP + 1))
             fi
-        done < <(grep -oP 'echo\s+"([^"]+)"\s+>\s+(\S+)' "$CFG_SERVICE" 2>/dev/null || true)
+        else
+            echo "  - single-core host: steering not applied"
+            VERIFY_SKIP=$((VERIFY_SKIP + 1))
+        fi
     else
         echo ""
-        echo "[SERVICE] Config not found: $CFG_SERVICE (run the script first)"
+        echo "[STEERING] Config not found: $CFG_SERVICE (run the script first)"
         VERIFY_SKIP=$((VERIFY_SKIP + 1))
+    fi
+
+    # 3. Confirm the boot-time re-apply script is present and executable.
+    # Only a failure if the unit actually references it — a unit written by an
+    # older version of this script inlined the logic instead, so report that as
+    # stale rather than broken.
+    if [[ -f "$CFG_SERVICE" ]]; then
+        echo ""
+        if ! grep -qF "$CFG_BOOT_SCRIPT" "$CFG_SERVICE" 2>/dev/null; then
+            echo "[BOOT] - $CFG_SERVICE predates the boot helper script"
+            echo "         re-run this script to regenerate it"
+            VERIFY_SKIP=$((VERIFY_SKIP + 1))
+        elif [[ -x "$CFG_BOOT_SCRIPT" ]]; then
+            echo "[BOOT] ✓ $CFG_BOOT_SCRIPT present and executable"
+            VERIFY_PASS=$((VERIFY_PASS + 1))
+        else
+            echo "[BOOT] ✗ $CFG_BOOT_SCRIPT missing or not executable"
+            echo "         $CFG_SERVICE references it; steering will not survive reboot"
+            VERIFY_FAIL=$((VERIFY_FAIL + 1))
+        fi
     fi
 
     # Summary
@@ -1742,25 +1865,6 @@ done
 echo ""
 echo "[IRQ] Configuring packet steering..."
 
-cpu_mask_for_cores() {
-    local cores=$1
-    [[ $cores -lt 1 ]] && cores=1
-    local groups rem mask
-    groups=$(((cores + 31) / 32))
-    rem=$((cores % 32))
-    mask=""
-    local i
-    for ((i = 0; i < groups; i++)); do
-        if ((i == 0 && rem != 0)); then
-            mask+=$(printf '%08x' $(((1 << rem) - 1)))
-        else
-            mask+="ffffffff"
-        fi
-        ((i < groups - 1)) && mask+=","
-    done
-    printf '%s\n' "$mask"
-}
-
 # Check if irqbalance is managing IRQ affinity
 if irqbalance_running; then
     echo "  INFO: irqbalance is active - skipping manual IRQ affinity"
@@ -1773,23 +1877,22 @@ if [ "$HW_CPU_CORES" -gt 1 ]; then
 
     for IFACE in /sys/class/net/*; do
         IFACE=$(basename "$IFACE")
-        [[ "$IFACE" =~ ^(lo|docker.*|br-.*|veth.*|virbr.*)$ ]] && continue
+        [[ "$IFACE" =~ $SKIP_IFACE_RE ]] && continue
         [ -d "/sys/class/net/$IFACE/device" ] || continue
 
         if [ "$OPT_DRY_RUN" -eq 1 ]; then
             [[ $OPT_REPORT -eq 0 ]] && echo "  [DRY-RUN] Would configure RPS/RFS/XPS for $IFACE (mask=$CPU_MASK)"
         else
-            # RPS/RFS
-            for rxq in "/sys/class/net/$IFACE/queues/rx-"*/rps_cpus; do
-                [ -f "$rxq" ] && write_value_quiet "$rxq" "$CPU_MASK"
+            # RPS (rx) and XPS (tx) both get the same allow-any-CPU mask.
+            for q in "/sys/class/net/$IFACE/queues/rx-"*/rps_cpus \
+                "/sys/class/net/$IFACE/queues/tx-"*/xps_cpus; do
+                [ -f "$q" ] || continue
+                write_value_quiet "$q" "$CPU_MASK"
             done
-            for rxq in "/sys/class/net/$IFACE/queues/rx-"*/rps_flow_cnt; do
-                [ -f "$rxq" ] && write_value_quiet "$rxq" "$RFS_ENTRIES"
-            done
-
-            # XPS: allow any CPU (simple + portable)
-            for txq in "/sys/class/net/$IFACE/queues/tx-"*/xps_cpus; do
-                [ -f "$txq" ] && write_value_quiet "$txq" "$CPU_MASK"
+            # RFS additionally needs a per-queue flow count.
+            for q in "/sys/class/net/$IFACE/queues/rx-"*/rps_flow_cnt; do
+                [ -f "$q" ] || continue
+                write_value_quiet "$q" "$RFS_ENTRIES"
             done
             echo "  ✓ $IFACE: RPS/RFS/XPS"
         fi
@@ -1846,6 +1949,114 @@ fi
 echo ""
 echo ">>> Phase 3: Creating Persistence Service..."
 
+# The boot-time logic lives in a standalone script rather than inline in
+# ExecStart=. systemd substitutes ${NAME} before exec (undefined -> empty
+# string) and reads a bare % as a specifier, so an embedded shell program has
+# to be double-escaped and mutates silently when that escaping is wrong. A
+# real file also lets the boot path reuse the same interface filter and
+# per-feature offload probe as the live path, so post-reboot state matches
+# what this run reported.
+backup_file "$CFG_BOOT_SCRIPT"
+write_file "$CFG_BOOT_SCRIPT" 0755 <<'BOOTEOF'
+#!/usr/bin/env bash
+# Auto-generated by network_optimize.sh — do not edit.
+#
+# Re-applies the runtime-only parts of the network tuning at boot: packet
+# steering (RPS/RFS/XPS) and NIC offloads. Kernel parameters are handled by
+# sysctl --system, not here. Everything is best effort; a NIC that rejects a
+# setting must not fail the unit.
+set -uo pipefail
+
+# Skip loopback, container, and bridge interfaces: steering them adds IPI
+# overhead on purely local traffic. Must stay in sync with network_optimize.sh.
+SKIP_IFACE_RE='^(lo|docker.*|br-.*|veth.*|virbr.*)$'
+
+# Write to a sysfs node, discarding both the write error and the shell's
+# redirect-open error. `>"$path" 2>/dev/null` would not suppress the latter:
+# redirections are applied left to right, so the open failure is reported
+# before stderr is redirected, spamming the journal on every boot.
+write_sysfs() {
+    local path=$1 value=$2
+    { printf '%s\n' "$value" >"$path"; } 2>/dev/null || return 0
+}
+
+# CPU mask covering $1 cores, as comma-separated 32-bit groups (low group
+# first, matching the sysfs rps_cpus/xps_cpus format).
+cpu_mask_for_cores() {
+    local cores=$1
+    [ "$cores" -lt 1 ] && cores=1
+    local groups rem mask i
+    groups=$(((cores + 31) / 32))
+    rem=$((cores % 32))
+    mask=""
+    for ((i = 0; i < groups; i++)); do
+        if ((i == 0 && rem != 0)); then
+            mask+=$(printf '%08x' $(((1 << rem) - 1)))
+        else
+            mask+="ffffffff"
+        fi
+        ((i < groups - 1)) && mask+=","
+    done
+    printf '%s\n' "$mask"
+}
+
+apply_packet_steering() {
+    local cores mask rfs_entries iface path
+    cores=$(nproc 2>/dev/null || echo 1)
+    # Steering across a single CPU is pointless overhead.
+    [ "$cores" -gt 1 ] || return 0
+    mask=$(cpu_mask_for_cores "$cores")
+    rfs_entries=$((32768 / cores))
+
+    for path in /sys/class/net/*; do
+        iface=${path##*/}
+        [[ $iface =~ $SKIP_IFACE_RE ]] && continue
+        # No device link means a virtual interface with no real queues.
+        [ -d "$path/device" ] || continue
+
+        # RPS (rx) and XPS (tx) both get the same allow-any-CPU mask.
+        for f in "$path/queues/rx-"*/rps_cpus "$path/queues/tx-"*/xps_cpus; do
+            [ -f "$f" ] || continue
+            write_sysfs "$f" "$mask"
+        done
+        # RFS needs the per-queue flow count as well as the global
+        # net.core.rps_sock_flow_entries that sysctl --system restores.
+        for f in "$path/queues/rx-"*/rps_flow_cnt; do
+            [ -f "$f" ] || continue
+            write_sysfs "$f" "$rfs_entries"
+        done
+    done
+}
+
+apply_offloads() {
+    command -v ethtool >/dev/null 2>&1 || return 0
+    local iface path features feat short
+    for path in /sys/class/net/*; do
+        iface=${path##*/}
+        [[ $iface =~ $SKIP_IFACE_RE ]] && continue
+        [ -d "$path/device" ] || continue
+
+        features=$(timeout 2 ethtool -k "$iface" 2>/dev/null) || continue
+        # Enable only features the NIC reports as supported-but-off, one at a
+        # time. A single `ethtool -K iface gro on gso on tso on` is rejected
+        # wholesale by NICs lacking any one of them, silently losing the rest.
+        for feat in generic-receive-offload:gro \
+            generic-segmentation-offload:gso \
+            tcp-segmentation-offload:tso \
+            scatter-gather:sg; do
+            short=${feat#*:}
+            if printf '%s\n' "$features" | grep -q "^${feat%%:*}: off\$"; then
+                timeout 2 ethtool -K "$iface" "$short" on >/dev/null 2>&1 || true
+            fi
+        done
+    done
+}
+
+apply_packet_steering
+apply_offloads
+exit 0
+BOOTEOF
+
 backup_file "$CFG_SERVICE"
 write_file "$CFG_SERVICE" <<EOF
 # =============================================================================
@@ -1855,6 +2066,8 @@ write_file "$CFG_SERVICE" <<EOF
 # This unit re-applies a subset of NIC/RPS tuning at boot. Kernel parameters are
 # persisted in:
 #   $CFG_SYSCTL
+# Runtime steering/offload logic lives in:
+#   $CFG_BOOT_SCRIPT
 #
 # Disable:
 #   systemctl disable network-optimize.service
@@ -1868,14 +2081,18 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 
+# Both lines are prefixed with '-' so a failure does not abort the unit. Per
+# systemd.service(5), in a Type=oneshot unit an un-prefixed command that exits
+# non-zero causes the remaining ExecStart lines to be skipped and the unit to
+# be marked failed. sysctl exits 1 whenever any key's /proc path is absent —
+# e.g. nf_conntrack not yet loaded this early in boot — which would otherwise
+# silently prevent the steering/offload re-apply below from ever running.
+
 # Re-apply sysctl parameters.
-ExecStart=/usr/bin/env sysctl --system
+ExecStart=-/usr/bin/env sysctl --system
 
-# Re-apply RPS CPU masks (best effort).
-ExecStart=/bin/bash -c 'cores=\$(nproc 2>/dev/null || echo 1); groups=\$(( (cores + 31) / 32 )); rem=\$(( cores %% 32 )); mask=""; for ((i=0; i<groups; i++)); do if (( i==0 && rem!=0 )); then mask+=\$(printf "%%08x" \$(( (1<<rem) - 1 ))); else mask+="ffffffff"; fi; (( i<groups-1 )) && mask+=","; done; for f in /sys/class/net/*/queues/rx-*/rps_cpus /sys/class/net/*/queues/tx-*/xps_cpus; do [ -f "\$f" ] && echo "\$mask" > "\$f" 2>/dev/null || true; done'
-
-# Re-enable common offloads (best effort).
-ExecStart=/bin/bash -c 'command -v ethtool >/dev/null 2>&1 || exit 0; for iface in \$(ls /sys/class/net/); do [ -e "/sys/class/net/\$iface/device" ] && ethtool -K "\$iface" gro on gso on tso on 2>/dev/null || true; done'
+# Re-apply packet steering (RPS/RFS/XPS) and NIC offloads.
+ExecStart=-$CFG_BOOT_SCRIPT
 RemainAfterExit=yes
 
 [Install]
@@ -1972,6 +2189,7 @@ echo "│ FILES CREATED                                                         
 echo "├─────────────────────────────────────────────────────────────────────────────┤"
 printf "│   %-73s │\n" "$CFG_SYSCTL"
 printf "│   %-73s │\n" "$CFG_SERVICE"
+printf "│   %-73s │\n" "$CFG_BOOT_SCRIPT"
 if [ "$CLOUD_PROVIDER" = "azure" ]; then
     printf "│   %-73s │\n" "$CFG_AZURE_UDEV_RING"
     printf "│   %-73s │\n" "$CFG_AZURE_UDEV_TXQ"

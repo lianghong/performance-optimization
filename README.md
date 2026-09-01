@@ -154,13 +154,22 @@ sudo ./network_optimize.sh --profile=vm
 /etc/security/limits.d/99-system-optimize.conf - Resource limits
 /etc/modprobe.d/99-system-optimize-blacklist.conf - Module blacklist
 /etc/systemd/system/system-optimize.service   - Persistence service
+/usr/local/sbin/system-optimize-boot.sh       - Boot-time sysfs helper (run by the service)
 ```
 
 ### network_optimize.sh
 ```
 /etc/sysctl.d/99-network-optimize.conf        - Network parameters
 /etc/systemd/system/network-optimize.service  - Persistence service
+/usr/local/sbin/network-optimize-boot.sh      - Boot-time steering/offload helper (run by the service)
 ```
+
+The `*-boot.sh` helpers hold everything the persistence service applies beyond
+sysctl (CPU governor, THP, I/O scheduler, C-states, RPS/RFS/XPS, NIC offloads).
+Keeping that logic in a script instead of inline `ExecStart=` commands avoids
+systemd's `$`/`%` substitution rules, which silently mangle shell globs and
+loops. `--verify` reads the generated script back to check for drift, so both
+files must stay in place for persistence to work.
 
 ## Auto-Tuning
 
@@ -355,6 +364,10 @@ sudo rm /etc/sysctl.d/99-system-optimize.conf
 sudo rm /etc/sysctl.d/99-network-optimize.conf
 sudo rm /etc/security/limits.d/99-system-optimize.conf
 sudo rm /etc/modprobe.d/99-system-optimize-blacklist.conf
+
+# Remove boot-time helper scripts
+sudo rm /usr/local/sbin/system-optimize-boot.sh
+sudo rm /usr/local/sbin/network-optimize-boot.sh
 
 # Disable services
 sudo systemctl disable system-optimize.service
